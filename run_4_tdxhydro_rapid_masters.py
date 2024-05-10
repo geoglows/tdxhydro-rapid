@@ -28,8 +28,8 @@ order_field = 'strmOrder'
 length_field = 'LengthGeodesicMeters'
 
 MAKE_RAPID_INPUTS = False
-MAKE_WEIGHT_TABLES = True
-CACHE_GEOMETRY = True
+MAKE_WEIGHT_TABLES = False
+CACHE_GEOMETRY = False
 VELOCITY_FACTOR = None
 MIN_VELOCITY_FACTOR = 0.25
 MIN_K_VALUE = 900  # 15 minutes in seconds

@@ -133,7 +133,8 @@ def rapid_master_files(streams_gpq: str,
 
     if dissolve_headwaters:
         logger.info('\tFinding headwater streams to dissolve')
-        geometry_diss = lambda x: gpd.GeoSeries(x).unary_union if cache_geometry else 'last'
+        # geometry_diss = lambda x: gpd.GeoSeries(x).unary_union if cache_geometry else 'last'
+        geometry_diss = lambda x: gpd.GeoSeries(x).unary_union
         headwater_dissolve_dfs = []
         for strmorder in range(2, min_headwater_stream_order + 1):
             branches = find_headwater_branches_to_dissolve(sgdf, G, strmorder)

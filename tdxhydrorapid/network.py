@@ -17,6 +17,7 @@ __all__ = [
     'correct_0_length_streams',
     'correct_0_length_basins',
     'make_final_streams',
+    'dissolve_catchments',
 ]
 
 logger = logging.getLogger(__name__)
@@ -331,3 +332,31 @@ def make_final_streams(final_inputs_directory: str,
             continue
         mgdf[mgdf['VPUCode'] == vpu_code].to_file(file_path)
     return
+
+
+def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame, id_field: str = 'LINKNO'):
+    headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
+    if os.path.exists(headwater_dissolve_path):
+        o2_to_dissolve = pd.read_csv(headwater_dissolve_path).fillna(-1).astype(int)
+        for streams_to_merge in o2_to_dissolve.values:
+            gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+
+    streams_to_prune_path = os.path.join(save_dir, 'mod_prune_streams.csv')
+    if os.path.exists(streams_to_prune_path):
+        ids_to_prune = pd.read_csv(streams_to_prune_path).astype(int).set_index('LINKTODROP')
+        gdf[id_field] = gdf[id_field].replace(ids_to_prune['LINKNO'])
+
+    drop_streams_path = os.path.join(save_dir, 'mod_drop_small_trees.csv')
+    if os.path.exists(drop_streams_path):
+        ids_to_drop = pd.read_csv(drop_streams_path).astype(int)
+        gdf = gdf[~gdf[id_field].isin(ids_to_drop.values.flatten())]
+
+    short_streams_path = os.path.join(save_dir, 'mod_merge_short_streams.csv')
+    if os.path.exists(short_streams_path):
+        short_streams = pd.read_csv(short_streams_path).astype(int)
+        for streams_to_merge in short_streams.values:
+            gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+
+    # dissolve the geometries based on shared value in the id field
+    gdf = gdf.dissolve(by=id_field).reset_index()
+    return gdf
