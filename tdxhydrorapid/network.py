@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+import json
 
 import geopandas as gpd
 import networkx as nx
@@ -308,6 +309,19 @@ def correct_0_length_basins(basins_gpq: str,
         logger.info('\tDeleting small trees')
         small_tree_df = pd.read_csv(small_tree_csv_path)
         basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(small_tree_df.values.flatten())]
+
+    lake_streams_path = os.path.join(save_dir, 'mod_dissolve_lakes.json')
+    if os.path.exists(lake_streams_path):
+        logger.info('\tAggregating lake streams catchments')
+        lake_streams_df = pd.read_json(lake_streams_path, orient='index', convert_axes=False, convert_dates=False)
+        streams_to_delete = set()
+        for outlet, _, lake_streams in lake_streams_df.itertuples():
+            streams_to_dissolve = set(lake_streams) | {outlet, }
+            streams_to_delete.update(streams_to_dissolve)
+            
+            basin_gdf.loc[basin_gdf[stream_id_col] == outlet, 'geometry'] = basin_gdf.loc[basin_gdf[stream_id_col].isin(streams_to_dissolve), 'geometry'].unary_union
+            
+        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(streams_to_delete)]
 
     basin_gdf = basin_gdf.reset_index(drop=True)
     return basin_gdf

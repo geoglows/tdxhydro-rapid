@@ -63,6 +63,7 @@ for streams_gpq, basins_gpq in gis_iterable:
     MERGE_SHORT_STREAMS = net_df.loc[net_df['region_number'] == region_num, 'merge_short_streams'].values[0]
     MIN_DRAINAGE_AREA_M2 = net_df.loc[net_df['region_number'] == region_num, 'min_area_km2'].values[0] * 1e6
     MIN_HEADWATER_STREAM_ORDER = net_df.loc[net_df['region_number'] == region_num, 'min_stream_order'].values[0]
+    DISSOLVE_LAKES = net_df.loc[net_df['region_number'] == region_num, 'dissolve_lakes'].values[0]
 
     # cast configs as correct data types
     CORRECT_TAUDEM_ERRORS = bool(CORRECT_TAUDEM_ERRORS)
@@ -72,6 +73,7 @@ for streams_gpq, basins_gpq in gis_iterable:
     MERGE_SHORT_STREAMS = bool(MERGE_SHORT_STREAMS)
     MIN_DRAINAGE_AREA_M2 = float(MIN_DRAINAGE_AREA_M2)
     MIN_HEADWATER_STREAM_ORDER = int(MIN_HEADWATER_STREAM_ORDER)
+    DISSOLVE_LAKES = bool(DISSOLVE_LAKES)
 
     try:
         # make the master rapid input files
@@ -86,6 +88,7 @@ for streams_gpq, basins_gpq in gis_iterable:
                                          prune_branches_from_main_stems=PRUNE_MAIN_STEMS,
                                          merge_short_streams=MERGE_SHORT_STREAMS,
                                          cache_geometry=CACHE_GEOMETRY,
+                                         dissolve_lakes=DISSOLVE_LAKES,
                                          min_drainage_area_m2=MIN_DRAINAGE_AREA_M2,
                                          min_headwater_stream_order=MIN_HEADWATER_STREAM_ORDER,
                                          min_velocity_factor=MIN_VELOCITY_FACTOR,

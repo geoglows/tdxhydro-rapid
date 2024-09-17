@@ -41,6 +41,7 @@ def rapid_master_files(streams_gpq: str,
                        prune_branches_from_main_stems: bool = True,
                        merge_short_streams: bool = True,
                        cache_geometry: bool = True,
+                       dissolve_lakes: bool = True,
                        min_drainage_area_m2: float = 200_000_000,
                        min_headwater_stream_order: int = 3,
                        min_velocity_factor: float = 0.25,
@@ -57,6 +58,7 @@ def rapid_master_files(streams_gpq: str,
         - mod_drop_small_streams.csv (if drop_small_watersheds is True)
         - mod_dissolved_headwaters.csv (if dissolve_headwaters is True)
         - mod_pruned_branches.csv (if prune_branches_from_main_stems is True)
+        - mod_dissovle_lakes.json (if dissolve_lakes is True)
 
 
     Args:
@@ -75,6 +77,7 @@ def rapid_master_files(streams_gpq: str,
         dissolve_headwaters: bool, dissolve headwater branches
         prune_branches_from_main_stems: bool, prune branches from main stems
         cache_geometry: bool, save the dissolved geometry as a geoparquet
+        dissolve_lakes: bool, clean up lake geometries
         min_drainage_area_m2: float, minimum drainage area in m2 to keep a watershed
         min_headwater_stream_order: int, minimum stream order to keep a headwater branch
 
@@ -114,6 +117,69 @@ def rapid_master_files(streams_gpq: str,
         .dropna()
         .astype(sgdf.dtypes.to_dict())
     )
+
+    if dissolve_lakes:
+        logger.info('\tDissolving lakes')
+        lake_ids = set(pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv'))[id_field])
+
+        lake_ids_in_network_df = sgdf[sgdf[id_field].isin(lake_ids)]
+        lake_g = create_directed_graphs(lake_ids_in_network_df, id_field, ds_id_field=ds_id_field)
+
+        outlets = [int(node) for node, degree in lake_g.out_degree() if degree == 0]
+        out_json = {}
+        streams_to_delete = set()
+        
+        for outlet in outlets:
+            lake_ancestors: set = nx.ancestors(lake_g, outlet)  # All nodes in lake that were in the CSV
+
+            # Outlet may not be the true outlet of the lake. We need to find the true outlet
+            current_stream = outlet
+            prev_stream_was_straight = False
+            while current_stream:
+                downstreams = list(G.successors(current_stream))
+                if not downstreams:  # No more downstream nodes
+                    break
+                prev_stream = current_stream
+                current_stream = downstreams[0]
+                if is_stream_a_straight_line(current_stream, id_field, sgdf):
+                    prev_stream_was_straight = True
+                    # Lake streams are straight lines. Let's eat them and move outlet
+                    lake_ancestors.add(prev_stream)
+                    lake_g.add_node(current_stream)
+                    lake_g.add_edge(prev_stream, current_stream)
+                    outlet = current_stream
+                else:
+                    if prev_stream_was_straight:
+                        # Let's eat the previous straight line, and the current node will be the new outlet
+                        lake_ancestors.add(prev_stream)
+                        lake_g.add_node(current_stream)
+                        lake_g.add_edge(prev_stream, current_stream)
+                        outlet = current_stream
+                    break
+
+            # Add initial inlet streams to the lake
+            # Any order 1 streams can be merged with lake
+            leaves = {node for node in lake_ancestors if lake_g.in_degree(node) == 0}
+            inlets = set()
+            inside_streams = lake_ancestors - leaves
+            for leaf in leaves:
+                if sgdf.loc[sgdf[id_field] == leaf, "strmOrder"].values[0] == 1:
+                    inside_streams.add(leaf)
+                else:
+                    inlets.add(leaf)
+
+            # Add streams that feed into the lake but are not in the lake
+            inlets.update({pred for n in inside_streams for pred in G.predecessors(n) if pred not in lake_ancestors})
+
+            streams_to_delete.update(inside_streams)
+            out_json[outlet] = {'inlets': list(inlets), 'inside': list(inside_streams)}
+            sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = outlet
+
+        with open(os.path.join(save_dir, 'mod_dissolve_lakes.json'), 'w') as f:
+            json.dump(out_json, f)
+        sgdf = sgdf[~sgdf[id_field].isin(streams_to_delete)]
+
+        G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field) # Need to recreate the graph after removing streams
 
     # Drop trees with small total length/area
     if drop_small_watersheds:
@@ -234,6 +300,17 @@ def rapid_master_files(streams_gpq: str,
     logger.info('\tWriting RAPID master parquet')
     sgdf.drop(columns=['geometry', ]).to_parquet(os.path.join(save_dir, "rapid_inputs_master.parquet"))
     return
+
+def is_stream_a_straight_line(stream_id: int, id_field: str, sgdf: gpd.GeoDataFrame) -> bool:
+    # heck if the stream is a straight line
+    geom = sgdf[sgdf[id_field]==stream_id].geometry.values[0]
+    if len(geom.coords) <= 2:
+        return True  
+    
+    straight_line_len = ((np.asarray(geom.coords[-1]) - np.asarray(geom.coords[0])) ** 2).sum()
+    true_len = geom.length ** 2
+
+    return abs(straight_line_len - true_len) < 1e-7
 
 
 def dissolve_branches(sgdf: pd.DataFrame,
