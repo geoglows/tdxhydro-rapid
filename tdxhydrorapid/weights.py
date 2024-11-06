@@ -192,7 +192,7 @@ def make_weight_table_from_netcdf(lsm_sample: str,
     tg_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(tg_gdf, npartitions=1)
     basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=80)
     intersections = overlay(basins_ddf, tg_ddf)
-    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=80).to_crs({'proj':'cea'}).area.compute()
+    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=80).area.compute()
 
     intersections.loc[intersections[id_field].isna(), id_field] = 0
 
