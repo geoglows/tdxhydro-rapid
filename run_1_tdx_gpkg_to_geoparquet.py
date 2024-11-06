@@ -54,6 +54,7 @@ if __name__ == '__main__':
         gdf['LINKNO'] = gdf['LINKNO'].astype(int) + (tdx_header_number * 10_000_000)
 
         if 'streamnet' in os.path.basename(gpkg):
+            gdf['LINKNO'] = gdf['LINKNO'].astype(int) + (tdx_header_number * 10_000_000)
             gdf['DSLINKNO'] = gdf['DSLINKNO'].astype(int)
             gdf.loc[gdf['DSLINKNO'] != -1, 'DSLINKNO'] = gdf['DSLINKNO'] + (tdx_header_number * 10_000_000)
             gdf['strmOrder'] = gdf['strmOrder'].astype(int)
@@ -73,6 +74,7 @@ if __name__ == '__main__':
             ]]
 
         else:
+            gdf['LINKNO'] = gdf['streamID'].astype(int) + (tdx_header_number * 10_000_000)
             gdf = gdf.drop(columns=['streamID'])
 
         gdf.to_parquet(out_file_name)

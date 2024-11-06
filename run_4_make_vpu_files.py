@@ -2,13 +2,15 @@ import logging
 import os
 import shutil
 import sys
+import glob
 
 import pandas as pd
 
 import tdxhydrorapid as rp
 
-tdx_inputs_dir = '/Volumes/T9Hales4TB/geoglows2/tdxhydro-inputs'
-final_output_dir = '/Volumes/T9Hales4TB/geoglows2/'
+tdx_inputs_dir = 'test/rapid_inputs'
+og_pqs = glob.glob("/Volumes/EB406_T7_3/geoglows_v3/parquets/TDX_streamnet_*_01.parquet")
+final_output_dir = 'test/outputs'
 vpu_inputs_dir = os.path.join(final_output_dir, 'inputs')
 gpkg_dir = os.path.join(final_output_dir, 'streams')
 vpu_assignment_table = './tdxhydrorapid/network_data/vpu_table.csv'
@@ -26,7 +28,7 @@ os.makedirs(gpkg_dir, exist_ok=True)
 logging.info('Creating Model Master Table')
 master_table_path = os.path.join(os.path.dirname(vpu_inputs_dir), 'geoglows-v2-master-table.parquet')
 if not os.path.exists(master_table_path):
-    rp.inputs.concat_tdxregions(tdx_inputs_dir, vpu_assignment_table, master_table_path)
+    rp.inputs.concat_tdxregions(tdx_inputs_dir, vpu_assignment_table, master_table_path, og_pqs)
 mdf = pd.read_parquet(master_table_path)
 logging.info(f'Total streams: {len(mdf)}')
 

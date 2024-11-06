@@ -1,7 +1,6 @@
 import glob
 import logging
 import os
-import json
 
 import geopandas as gpd
 import networkx as nx
@@ -18,6 +17,7 @@ __all__ = [
     'correct_0_length_streams',
     'correct_0_length_basins',
     'make_final_streams',
+    'dissolve_catchments',
 ]
 
 logger = logging.getLogger(__name__)
@@ -29,48 +29,39 @@ def sort_topologically(digraph_from_headwaters: nx.DiGraph) -> np.array:
 
 def create_directed_graphs(df: pd.DataFrame,
                            id_field='LINKNO',
-                           ds_id_field='DSLINKNO', ):
-    G = nx.DiGraph()
-
-    for node in df[id_field].values:
-        G.add_node(node)
-    for i, row in df.iterrows():
-        if row[ds_id_field] != -1:
-            G.add_edge(row[id_field], row[ds_id_field])
+                           ds_id_field='DSLINKNO', ) -> nx.DiGraph:
+    G: nx.DiGraph = nx.from_pandas_edgelist(df[df[ds_id_field] != -1], source=id_field, target=ds_id_field, create_using=nx.DiGraph)
+    G.add_nodes_from(df[id_field].values)
     return G
 
 
-def find_headwater_branches_to_dissolve(sdf: pd.DataFrame or gpd.GeoDataFrame,
+def find_headwater_branches_to_dissolve(sdf: gpd.GeoDataFrame,
                                         G: nx.DiGraph,
                                         min_order_to_keep: int,
                                         stream_order_field: str = 'strmOrder',
                                         id_field: str = 'LINKNO', ) -> pd.DataFrame:
     # select rows where the number of predecessors in the graph is 2+ and 2+ of them and 2+ are min_order_to_keep - 1
-    def _is_headwater_branch(row):
-        predecessors = list(G.predecessors(row[id_field]))
-
-        # if there are only 0 or 1 predecessors then it is not a headwater branch
-        if len(predecessors) < 2:
-            return False
-
-        # get the stream order of all predecessors
-        pred_orders = [sdf.loc[sdf[id_field] == x, stream_order_field].values[0] for x in predecessors]
-
-        # check if there are 2+ predecessors with order min_order_to_keep - 1
-        if len(predecessors) == 2 and not len([x for x in pred_orders if x == (min_order_to_keep - 1)]) == 2:
-            return False
-
-        if (len(predecessors) > 2) and \
-                (not max(pred_orders) == min_order_to_keep - 1) and \
-                (len([x for x in pred_orders if x == (min_order_to_keep - 1)]) >= 2):
-            return False
-        return True
-
     # todo parameterize the column names
     # order1 = sdf[sdf['strmOrder'] == (min_order_to_keep - 1)]['LINKNO'].values.flatten()
     candidate_streams = sdf[sdf[stream_order_field] == min_order_to_keep]
 
-    candidate_streams = candidate_streams[candidate_streams.apply(_is_headwater_branch, axis=1)]
+    stream_orders_dict = sdf[[id_field, stream_order_field]].set_index(id_field)[stream_order_field].to_dict()
+
+    more_candidates = set()
+    for stream_id in candidate_streams[id_field].values:
+        predecessors = list(G.predecessors(stream_id))
+        if len(predecessors) < 2:
+            continue
+        pred_orders = list(stream_orders_dict[x] for x in predecessors)
+
+        if len(pred_orders) == 2 and not len([x for x in pred_orders if x == (min_order_to_keep - 1)]) == 2:
+            continue
+
+        if (len(pred_orders) > 2) and \
+                (not max(pred_orders) == min_order_to_keep - 1) and \
+                (len([x for x in pred_orders if x == (min_order_to_keep - 1)]) >= 2):
+            continue
+        more_candidates.add(stream_id)
 
     # order2 = order2[order2[us_cols].isin(order1).sum(axis=1) >= 2]
     candidate_streams = candidate_streams[['LINKNO', ]]
@@ -83,7 +74,6 @@ def find_headwater_branches_to_dissolve(sdf: pd.DataFrame or gpd.GeoDataFrame,
     upstream_df = upstream_df.reset_index()
     return upstream_df
 
-
 def find_branches_to_prune(sdf: gpd.GeoDataFrame or pd.DataFrame,
                            G: nx.DiGraph,
                            id_field: str = 'LINKNO',
@@ -93,14 +83,21 @@ def find_branches_to_prune(sdf: gpd.GeoDataFrame or pd.DataFrame,
     # select the order 1s whose downstream is 2+
     order1s = order1s.loc[order1s[ds_id_field].isin(sdf.loc[sdf['strmOrder'] >= 2, id_field].values)]
 
-    sibling_pairs = pd.DataFrame(columns=['LINKNO', 'LINKTODROP'])
+    sibling_pairs = [] 
+    do_not_delete = set()
     for index, row in order1s.iterrows():
+        if row[id_field] in do_not_delete:
+            continue
+
         siblings = list(G.predecessors(row[ds_id_field]))
         siblings = [s for s in siblings if s != row[id_field]]
 
+        if len(siblings) > 2:
+            # This is an inlet to a lake. It should merge with the downstream stream
+            siblings = [row[ds_id_field], ]
         # if there is only 1 sibling, we want to merge with that one
         # if there are 2+ siblings, we want need to figure out which one to merge with
-        if len(siblings) > 1:
+        elif len(siblings) > 1:
             sibling_stream_orders = sdf[sdf[id_field].isin(siblings)]['strmOrder'].values
 
             # Case: 1 of the siblings has same order, one has higher order -> pick the highest stream order
@@ -130,12 +127,17 @@ def find_branches_to_prune(sdf: gpd.GeoDataFrame or pd.DataFrame,
                     print(siblings)
                     print(row)
 
-        # In the case where there is a 3 river confluence, there may be more than 1 order 1 stream that must be merged.
-        # Instead of creating a dictionary to store these values (which can only have one unique key), we use a DataFrame directly
-        new_row = {'LINKNO': siblings[0], 'LINKTODROP': row[id_field]}
-        sibling_pairs.loc[sibling_pairs.shape[0]] = new_row
+        if not siblings:
+            # Let's merge with the downstream stream
+            siblings = [row[ds_id_field], ]
 
-    return sibling_pairs
+        # In the case where there is a 3 river confluence, there may be more than 1 order 1 stream that must be merged.
+        # Instead of creating a dictionary to store these values (which can only have one unique key), we use a list of dictionaries (faster than appending to dataframe directly)
+        new_row = {'LINKNO': siblings[0], 'LINKTODROP': row[id_field]}
+        do_not_delete.add(siblings[0])
+        sibling_pairs.append(new_row)
+
+    return pd.DataFrame(sibling_pairs)
 
 
 def identify_0_length(gdf: gpd.GeoDataFrame,
@@ -272,6 +274,7 @@ def correct_0_length_basins(basins_gpq: str,
 
     """
     basin_gdf = gpd.read_parquet(basins_gpq)
+    basin_gdf = basin_gdf.set_index(stream_id_col)
 
     zero_fix_csv_path = os.path.join(save_dir, 'mod_basin_zero_centroid.csv')
     if os.path.exists(zero_fix_csv_path):
@@ -287,7 +290,7 @@ def correct_0_length_basins(basins_gpq: str,
                 centroid_y + box_radius_degrees
             )],
             stream_id_col: [0, ]
-        }, crs=basin_gdf.crs)
+        }, crs=basin_gdf.crs).set_index(stream_id_col)
         basin_gdf = pd.concat([basin_gdf, link_zero_box])
 
     zero_length_csv_path = os.path.join(save_dir, 'mod_zero_length_streams.csv')
@@ -296,34 +299,33 @@ def correct_0_length_basins(basins_gpq: str,
         zero_length_df = pd.read_csv(zero_length_csv_path)
         # Case 1 - Coastal w/ no upstream or downstream - Delete the stream and its basin
         logger.info('\tHandling Case 1 0 Length Streams - delete basins')
-        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(zero_length_df['case1'])]
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(zero_length_df['case1'])]
         # Case 2 - Allow 3-river confluence - basin does not exist (try to delete just in case)
         logger.info('\tHandling Case 2 0 Length Streams - delete basins')
-        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(zero_length_df['case2'])]
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(zero_length_df['case2'])]
         # Case 3 - Coastal w/ upstreams but no downstream - basin exists so delete it
         logger.info('\tHandling Case 3 0 Length Streams - delete basins')
-        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(zero_length_df['case3'])]
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(zero_length_df['case3'])]
 
     small_tree_csv_path = os.path.join(save_dir, 'mod_drop_small_trees.csv')
     if os.path.exists(small_tree_csv_path):
         logger.info('\tDeleting small trees')
         small_tree_df = pd.read_csv(small_tree_csv_path)
-        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(small_tree_df.values.flatten())]
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(small_tree_df.values.flatten())]
 
-    lake_streams_path = os.path.join(save_dir, 'mod_dissolve_lakes.json')
-    if os.path.exists(lake_streams_path):
-        logger.info('\tAggregating lake streams catchments')
-        lake_streams_df = pd.read_json(lake_streams_path, orient='index', convert_axes=False, convert_dates=False)
-        streams_to_delete = set()
-        for outlet, _, lake_streams in lake_streams_df.itertuples():
-            streams_to_dissolve = set(lake_streams) | {outlet, }
-            streams_to_delete.update(streams_to_dissolve)
-            
-            basin_gdf.loc[basin_gdf[stream_id_col] == outlet, 'geometry'] = basin_gdf.loc[basin_gdf[stream_id_col].isin(streams_to_dissolve), 'geometry'].unary_union
-            
-        basin_gdf = basin_gdf[~basin_gdf[stream_id_col].isin(streams_to_delete)]
+    within_sea_streams_path = os.path.join(save_dir, 'mod_drop_within_sea.csv')
+    if os.path.exists(within_sea_streams_path):
+        logger.info('\tDeleting basins within the sea')
+        within_sea_streams_df = pd.read_csv(within_sea_streams_path)
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(within_sea_streams_df.values.flatten())]
 
-    basin_gdf = basin_gdf.reset_index(drop=True)
+    drop_ocean_watersheds_path = os.path.join(save_dir, 'mod_drop_ocean_watersheds.csv')
+    if os.path.exists(drop_ocean_watersheds_path):
+        logger.info('\tDeleting small ocean watersheds')
+        drop_ocean_watersheds_df = pd.read_csv(drop_ocean_watersheds_path)
+        basin_gdf = basin_gdf[~basin_gdf.index.isin(drop_ocean_watersheds_df.values.flatten())]
+
+    basin_gdf = basin_gdf.reset_index()
     return basin_gdf
 
 
@@ -345,3 +347,34 @@ def make_final_streams(final_inputs_directory: str,
             continue
         mgdf[mgdf['VPUCode'] == vpu_code].to_file(file_path)
     return
+
+def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame, fs,  id_field: str = 'LINKNO') -> gpd.GeoDataFrame:
+    headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
+    if fs.exists(headwater_dissolve_path):
+        with fs.open(headwater_dissolve_path) as f:
+            o2_to_dissolve = pd.read_csv(f).fillna(-1).astype(int)
+        for streams_to_merge in o2_to_dissolve.values:
+            gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+
+    streams_to_prune_path = os.path.join(save_dir, 'mod_prune_streams.csv')
+    if fs.exists(streams_to_prune_path):
+        with fs.open(streams_to_prune_path) as f:
+            ids_to_prune = pd.read_csv(f).astype(int).set_index('LINKTODROP')
+        gdf[id_field] = gdf[id_field].replace(ids_to_prune['LINKNO'])
+
+    drop_streams_path = os.path.join(save_dir, 'mod_drop_small_trees.csv')
+    if fs.exists(drop_streams_path):
+        with fs.open(drop_streams_path) as f:
+            ids_to_drop = pd.read_csv(f).astype(int)
+        gdf = gdf[~gdf[id_field].isin(ids_to_drop.values.flatten())]
+
+    short_streams_path = os.path.join(save_dir, 'mod_merge_short_streams.csv')
+    if fs.exists(short_streams_path):
+        with fs.open(short_streams_path) as f:
+            short_streams = pd.read_csv(f).astype(int)
+        for streams_to_merge in short_streams.values:
+            gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+
+    # dissolve the geometries based on shared value in the id field
+    gdf = gdf.dissolve(by=id_field).reset_index()
+    return gdf

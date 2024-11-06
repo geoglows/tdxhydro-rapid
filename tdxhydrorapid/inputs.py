@@ -28,7 +28,6 @@ __all__ = [
     'vpu_files_from_masters',
 ]
 
-
 def rapid_master_files(streams_gpq: str,
                        save_dir: str,
                        id_field: str = 'LINKNO',
@@ -42,6 +41,10 @@ def rapid_master_files(streams_gpq: str,
                        merge_short_streams: bool = True,
                        cache_geometry: bool = True,
                        dissolve_lakes: bool = True,
+                       drop_islands: bool = True,
+                       drop_ocean_watersheds: bool = True,
+                       drop_within_sea: bool = True,
+                       drop_low_flow: bool = False,
                        min_drainage_area_m2: float = 200_000_000,
                        min_headwater_stream_order: int = 3,
                        min_velocity_factor: float = 0.25,
@@ -75,6 +78,10 @@ def rapid_master_files(streams_gpq: str,
 
         drop_small_watersheds: bool, drop small watersheds
         dissolve_headwaters: bool, dissolve headwater branches
+        drop_islands: bool, drop islands
+        drop_ocean_watersheds: bool, drop ocean watersheds
+        drop_within_sea: bool, drop streams within the sea
+        drop_low_flow: bool, drop low flow streams
         prune_branches_from_main_stems: bool, prune branches from main stems
         cache_geometry: bool, save the dissolved geometry as a geoparquet
         dissolve_lakes: bool, clean up lake geometries
@@ -126,7 +133,7 @@ def rapid_master_files(streams_gpq: str,
         lake_g = create_directed_graphs(lake_ids_in_network_df, id_field, ds_id_field=ds_id_field)
 
         outlets = [int(node) for node, degree in lake_g.out_degree() if degree == 0]
-        out_json = {}
+        dissolve_lake_dict: dict[int, dict[str, list]] = {}
         streams_to_delete = set()
         
         for outlet in outlets:
@@ -136,11 +143,11 @@ def rapid_master_files(streams_gpq: str,
             current_stream = outlet
             prev_stream_was_straight = False
             while current_stream:
-                downstreams = list(G.successors(current_stream))
-                if not downstreams:  # No more downstream nodes
+                downstream_list = list(G.successors(current_stream))
+                if not downstream_list:  # No more downstream nodes
                     break
                 prev_stream = current_stream
-                current_stream = downstreams[0]
+                current_stream = downstream_list[0]
                 if is_stream_a_straight_line(current_stream, id_field, sgdf):
                     prev_stream_was_straight = True
                     # Lake streams are straight lines. Let's eat them and move outlet
@@ -172,14 +179,34 @@ def rapid_master_files(streams_gpq: str,
             inlets.update({pred for n in inside_streams for pred in G.predecessors(n) if pred not in lake_ancestors})
 
             streams_to_delete.update(inside_streams)
-            out_json[outlet] = {'inlets': list(inlets), 'inside': list(inside_streams)}
+            if outlet in dissolve_lake_dict:
+                dissolve_lake_dict[outlet]['inlets'].extend(list(inlets))
+                dissolve_lake_dict[outlet]['inside'].extend(list(inside_streams))
+            else:
+                dissolve_lake_dict[outlet] = {'inlets': list(inlets), 'inside': list(inside_streams)}
+
             sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = outlet
 
+        # We need to check that no outlets are lakes to delete
+        outlets = set(dissolve_lake_dict.keys())
+        for outlet in outlets:
+            if outlet in streams_to_delete:
+                # Find the real outlet
+                for key, items in dissolve_lake_dict.items():
+                    if outlet in items:
+                        break
+                real_outlet = key
+                dissolve_lake_dict[real_outlet]['inside'].extend(dissolve_lake_dict[outlet]['inside'])
+                dissolve_lake_dict[real_outlet]['inlets'].extend(dissolve_lake_dict[outlet]['inlets'])
+                del dissolve_lake_dict[outlet]
+                inlets = sgdf[sgdf[ds_id_field] == outlet][id_field]
+                sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = real_outlet
+
         with open(os.path.join(save_dir, 'mod_dissolve_lakes.json'), 'w') as f:
-            json.dump(out_json, f)
+            json.dump(dissolve_lake_dict, f)
         sgdf = sgdf[~sgdf[id_field].isin(streams_to_delete)]
 
-        G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field) # Need to recreate the graph after removing streams
+        G = create_directed_graphs(sgdf, id_field, ds_id_field) # Need to recreate the graph after removing streams
 
     # Drop trees with small total length/area
     if drop_small_watersheds:
@@ -196,17 +223,146 @@ def rapid_master_files(streams_gpq: str,
             .to_csv(os.path.join(save_dir, 'mod_drop_small_trees.csv'), index=False)
         )
         sgdf = sgdf.loc[~sgdf[id_field].isin(small_tree_segments)]
+        G = create_directed_graphs(sgdf, id_field, ds_id_field)
+
+    if drop_low_flow:
+        logger.info('\tFinding and removing low flow streams')
+        low_flow_rivers = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'rivids_lt_5_cms.csv')) 
+        low_flow_rivers = set(sgdf[sgdf[id_field].isin(low_flow_rivers['LINKNO'].values)][id_field])
+
+        streams_to_delete = set()
+        low_flow_dict: dict[int, list] = {} # Outlets to upstreams
+        for river in low_flow_rivers:
+            downstream = list(G.successors(river))
+            if downstream and downstream[0] in low_flow_rivers:
+                    continue # Skip this river until we find an "outlet"
+            if downstream:
+                downstream = downstream[0]
+            else: 
+                downstream = -1  
+                
+            ancestors: set = nx.ancestors(G, river) | {river, }
+
+            if downstream in low_flow_dict:
+                low_flow_dict[downstream].extend(ancestors)
+            else:
+                low_flow_dict[downstream] = list(ancestors)
+            streams_to_delete.update(ancestors)
+
+        sgdf = sgdf[~sgdf[id_field].isin(streams_to_delete)]
+
+        with open(os.path.join(save_dir, 'mod_drop_low_flow.json'), 'w') as f:
+            json.dump(low_flow_dict, f)
+
+        G = create_directed_graphs(sgdf, id_field, ds_id_field)
+        
+    if drop_within_sea:
+        # From a previous step, we know all ocean streams have downstreams already dealt with, so only need to focus on upstreams
+        logger.info('\tFinding and removing streams within the sea')
+        bad_df = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'bad_streams.csv'))
+        sea_rivers = set(bad_df.loc[bad_df['type'] == 'within_sea', id_field])
+        
+        # Get only sea rivers that are in sgdf
+        sea_rivers = sea_rivers.intersection(sgdf[id_field].values)
+
+        new_sea_outlets = set()
+        for downstream in sea_rivers:
+            upstreams = set(G.predecessors(downstream))
+            new_sea_outlets.update(upstreams)
+            
+        sgdf.loc[sgdf[id_field].isin(new_sea_outlets), ds_id_field] = -1
+        sgdf = sgdf[~sgdf[id_field].isin(sea_rivers)]
+        pd.DataFrame({'drop': list(sea_rivers)}).to_csv(
+            os.path.join(save_dir, 'mod_drop_within_sea.csv'), index=False
+        )
+        G = create_directed_graphs(sgdf, id_field, ds_id_field)
+
+    if drop_islands:
+        logging.info('\tFinding and removing islands')
+        bad_df = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'bad_streams.csv'))
+        island_ids = set(bad_df.loc[bad_df['type'] == 'island', id_field])
+        island_g = create_directed_graphs(sgdf[sgdf[id_field].isin(island_ids)], id_field, ds_id_field=ds_id_field)
+        island_outlets = [int(node) for node, degree in island_g.out_degree() if degree == 0]
+
+        islands_dict: dict[int, list] = {}
+        to_delete = set()
+        for outlet in island_outlets:
+            # Go 1 island watershed at a time
+            island_ancestors: set = nx.ancestors(island_g, outlet)
+            outlet_siblings = set(G.predecessors(outlet))
+            for outlet_sibling in outlet_siblings:
+                if outlet_sibling not in island_ids:
+                    downstream = outlet
+                    break
+            else:
+                # Yes, this step is necessary
+                island_ancestors.add(outlet)
+                downstream_list = list(G.successors(outlet))
+                if downstream_list:
+                    downstream = downstream_list[0]
+                    while downstream in island_ids:
+                        downstream_list = list(G.successors(downstream))
+                        if not downstream_list:
+                            downstream = -1
+                            break
+                        downstream = downstream_list[0]
+                else:
+                    downstream = -1
+
+            to_delete.update(island_ancestors)
+            island_inlets = set()
+            for node in island_ancestors:
+                island_inlets.update(set(G.predecessors(node)).difference(island_ancestors))
+            
+            if downstream in islands_dict:
+                islands_dict[downstream].extend(island_ancestors)
+            else:
+                islands_dict[downstream] = list(island_ancestors)
+            # Set the downstream of the inlets
+            sgdf.loc[sgdf[id_field].isin(island_inlets), ds_id_field] = downstream
+        
+        # We need to check that no outlets are in other outlets
+        outlets = set(islands_dict.keys())
+        for outlet in outlets:
+            if outlet in to_delete:
+                # Find the real outlet
+                for key, items in islands_dict.items():
+                    if outlet in items:
+                        break
+                real_outlet = key
+                islands_dict[real_outlet].extend(islands_dict[outlet])
+                del islands_dict[outlet]
+                inlets = sgdf[sgdf[ds_id_field] == outlet][id_field]
+                sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = real_outlet
+        
+        sgdf = sgdf[~sgdf[id_field].isin(to_delete)]
+
+        with open(os.path.join(save_dir, 'mod_dissolve_islands.json'), 'w') as f:
+            json.dump(islands_dict, f)
+
+        # recreate the directed graph because the network connectivity is now different
+        G = create_directed_graphs(sgdf, id_field, ds_id_field)
+
+    if drop_ocean_watersheds:
+        logger.info('\tFinding and removing ocean watersheds')
+        bad_df = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'bad_streams.csv'))
+        small_watershed_rivers = set(bad_df.loc[bad_df['type'] == 'small_ocean_watershed', id_field])
+        sgdf = sgdf[~sgdf[id_field].isin(small_watershed_rivers)]
+
+        bad_df[bad_df['type'] == 'small_ocean_watershed'].to_csv(
+            os.path.join(save_dir, 'mod_drop_ocean_watersheds.csv'), index=False
+        )
+        G = create_directed_graphs(sgdf, id_field, ds_id_field)
 
     if dissolve_headwaters:
         logger.info('\tFinding headwater streams to dissolve')
-        geometry_diss = lambda x: gpd.GeoSeries(x).unary_union if cache_geometry else 'last'
         headwater_dissolve_dfs = []
         for strmorder in range(2, min_headwater_stream_order + 1):
             branches = find_headwater_branches_to_dissolve(sgdf, G, strmorder)
             if strmorder == 2:
-                sgdf = dissolve_branches(sgdf, branches, geometry_diss=geometry_diss, k_agg_func=_k_agg_order_2)
+                sgdf = dissolve_branches(sgdf, branches, geometry_diss=cache_geometry, k_agg_func=_k_agg_order_2)
             elif strmorder == 3:
-                sgdf = dissolve_branches(sgdf, branches, geometry_diss=geometry_diss, k_agg_func=_k_agg_order_3)
+                sgdf = dissolve_branches(sgdf, branches, geometry_diss=cache_geometry, k_agg_func=_k_agg_order_3)
             headwater_dissolve_dfs.append(branches)
         (
             pd
@@ -312,10 +468,9 @@ def is_stream_a_straight_line(stream_id: int, id_field: str, sgdf: gpd.GeoDataFr
 
     return abs(straight_line_len - true_len) < 1e-7
 
-
-def dissolve_branches(sgdf: pd.DataFrame,
+def dissolve_branches(sgdf: gpd.GeoDataFrame,
                       head_to_dissolve: pd.DataFrame,
-                      geometry_diss: types.FunctionType or str = 'last',
+                      geometry_diss: bool = False,
                       k_agg_func: types.FunctionType or str = 'last', ) -> pd.DataFrame:
     """
     Use pandas groupby to "dissolve" streams in the table by combining rows and handle metadata correctly
@@ -323,36 +478,32 @@ def dissolve_branches(sgdf: pd.DataFrame,
     Args:
         sgdf: streams geodataframe with all the metadata columns from the source files
         head_to_dissolve: dataframe with the values of streams to be dissolved and the ID they are dissolved to
-        geometry_diss: a string or function to use in groupby to handle combining the geometry column
+        geometry_diss: a boolean to determine if the geometry should be dissolved
         k_agg_func: a string or function to use in groupby to handle combining the k_agg column
 
     Returns:
         a copy of the streams geodataframe with rows dissolved
     """
     logger.info('\tDissolving headwater streams in inputs master')
-    for streams_to_merge in head_to_dissolve.values:
-        sgdf.loc[sgdf['LINKNO'].isin(streams_to_merge), 'LINKNO'] = streams_to_merge[0]
-    agg_rules = {
-        # 'LINKNO': 'last',
-        'DSLINKNO': 'last',
-        'strmOrder': 'last',
-        'Magnitude': 'last',
-        'DSContArea': 'last',
-        'USContArea': lambda x: x.iloc[:-1].sum() if len(x) > 1 else x.iloc[0],
-        'LengthGeodesicMeters': 'last',
-        'TDXHydroRegion': 'last',
-        'TopologicalOrder': 'last',
-        'geometry': geometry_diss,
-    }
+    dissolve_map = {stream: streams[0] for streams in head_to_dissolve.values for stream in streams}
+    sgdf['LINKNO'] = sgdf['LINKNO'].map(lambda x: dissolve_map.get(x, x))
 
-    # if all([x in sgdf.columns for x in ['musk_k', 'musk_x', 'velocity_factor', 'CountUS', ]]):
-    #     agg_rules.update({
-    #         'musk_k': k_agg_func,
-    #         'musk_x': 'last',
-    #         'velocity_factor': 'last',
-    #         'CountUS': lambda x: 0 if len(x) else x,
-    #     })
-    return sgdf.groupby('LINKNO').agg(agg_rules).reset_index().sort_values('TopologicalOrder')
+    groups = sgdf.groupby('LINKNO')
+
+    # This is the fastest way to groupby and dissolve
+    return (gpd.GeoDataFrame({'LINKNO': groups['LINKNO'].first(),
+                              'DSLINKNO': groups['DSLINKNO'].last(),
+                              'strmOrder': groups['strmOrder'].last(),
+                              'Magnitude': groups['Magnitude'].last(),
+                              'DSContArea': groups['DSContArea'].last(),
+                              'USContArea': groups['USContArea'].agg(lambda x: x.iloc[:-1].sum() if len(x) > 1 else x.iloc[0]),
+                              'LengthGeodesicMeters': groups['LengthGeodesicMeters'].last(),
+                              'TDXHydroRegion': groups['TDXHydroRegion'].last(),
+                              'TopologicalOrder': groups['TopologicalOrder'].last(),
+                              'geometry': sgdf.dissolve(by='LINKNO').geometry} if geometry_diss else groups['geometry'].last()) # Default values are fastest
+            .reset_index(drop=True)
+            .sort_values('TopologicalOrder')
+            )
 
 
 def prune_branches(sdf: pd.DataFrame, streams_to_prune: pd.DataFrame) -> pd.DataFrame:
@@ -370,31 +521,32 @@ def dissolve_short_streams(sgdf: gpd.GeoDataFrame, short_streams: pd.DataFrame) 
         geodataframe
     """
     logger.info('\tDissolving short streams')
+    sgdf = sgdf.reset_index(drop=True) # Allows us to use index-based lookup, faster
+    rows_to_drop = set()
+
     for idx, (river_id_to_keep, river_id_to_drop) in short_streams.iterrows():
-        row_to_keep = sgdf[sgdf['LINKNO'] == river_id_to_keep].copy()
-        row_to_drop = sgdf[sgdf['LINKNO'] == river_id_to_drop].copy()
+        row_to_keep: pd.Series = sgdf['LINKNO'] == river_id_to_keep
+        row_to_drop: pd.Series = sgdf['LINKNO'] == river_id_to_drop
 
         # if both ids are not in the dataframe then skip. Some rivers will get merged together first
-        if row_to_keep.empty or row_to_drop.empty:
+        if not row_to_keep.any() or not row_to_drop.any():
             continue
 
-        combined_geometry = (
-            gpd
-            .GeoSeries(sgdf[sgdf['LINKNO'].isin([river_id_to_keep, river_id_to_drop])].geometry)
-            .unary_union
-        )
+        keep_row: pd.Series = sgdf.loc[row_to_keep].squeeze()  # Extract the row as a series
+        drop_row: pd.Series = sgdf.loc[row_to_drop].squeeze()
+        index = keep_row.name
 
-        row_to_keep['geometry'] = combined_geometry
-        row_to_keep['USContArea'] = min([row_to_keep['USContArea'].values[0], row_to_drop['USContArea'].values[0]])
-        row_to_keep['DSContArea'] = max([row_to_keep['DSContArea'].values[0], row_to_drop['DSContArea'].values[0]])
-        row_to_keep['LengthGeodesicMeters'] = (
-                row_to_keep['LengthGeodesicMeters'].values[0] +
-                row_to_drop['LengthGeodesicMeters'].values[0]
-        )
+        combined_geometry = keep_row['geometry'].union(drop_row['geometry'])
 
-        sgdf = sgdf[~sgdf['LINKNO'].isin([river_id_to_keep, river_id_to_drop])]
-        sgdf = pd.concat([sgdf, row_to_keep])
+        sgdf.at[index, 'geometry'] = combined_geometry
+        sgdf.at[index, 'USContArea'] = min(keep_row['USContArea'], drop_row['USContArea'])
+        sgdf.at[index, 'DSContArea'] = max(keep_row['DSContArea'], drop_row['DSContArea'])
+        sgdf.at[index, 'LengthGeodesicMeters'] = keep_row['LengthGeodesicMeters'] + drop_row['LengthGeodesicMeters']
+ 
+        rows_to_drop.add(river_id_to_drop)
         sgdf.loc[sgdf['DSLINKNO'] == river_id_to_drop, 'DSLINKNO'] = river_id_to_keep
+
+    sgdf = sgdf[~sgdf['LINKNO'].isin(rows_to_drop)]
     return gpd.GeoDataFrame(sgdf.reset_index(drop=True))
 
 
@@ -460,15 +612,42 @@ def rapid_input_csvs(sdf: pd.DataFrame,
     return
 
 
-def concat_tdxregions(tdxinputs_dir: str, vpu_assignment_table: str, master_table_path: str) -> None:
+def concat_tdxregions(tdxinputs_dir: str, vpu_assignment_table: str, master_table_path: str, original_streams: list[str] = None) -> None:
+    """
+    If the VPU code is not in the master table, this function will attempt to find the VPU code for each terminal node
+    by looking at the VPU code of the downstream terminal node (if og_pqs is not None). If the downstream terminal node does not have a VPU code,
+    the function will look at the downstream terminal node of the downstream terminal node. This will continue until a VPU
+    code is found or the terminal node is not in the VPU table. If the terminal node is not in the VPU table, the terminal
+    node will be written to a csv file and the function will raise an error.
+    """
     mdf = pd.concat([pd.read_parquet(f) for f in glob.glob(os.path.join(tdxinputs_dir, '*', 'rapid_inputs*.parquet'))])
-
     vpu_df = pd.read_csv(vpu_assignment_table)
     mdf = mdf.merge(vpu_df, on='TerminalLink', how='left')
 
     if not mdf[mdf['VPUCode'].isna()].empty:
-        mdf[mdf['VPUCode'].isna()].to_csv(os.path.join(os.path.dirname(master_table_path), 'missing_vpu_label.csv'))
-        raise RuntimeError('Some terminal nodes are not in the VPU table and must be fixed before continuing.')
+        if original_streams is not None:
+            graphs = []
+            for pq in original_streams:
+                graphs.append(create_directed_graphs(pd.read_parquet(pq, columns=['LINKNO', 'DSLINKNO']), 'LINKNO', ds_id_field='DSLINKNO'))
+            G: nx.DiGraph = nx.compose_all(graphs)
+
+            for terminal_id, vpu in vpu_df.values:
+                mdf.loc[mdf['TerminalLink'] == terminal_id, 'VPUCode'] = vpu
+
+            vpu_dict = vpu_df.set_index('TerminalLink')['VPUCode'].to_dict() # Allows for quick lookup
+            for terminal_id in mdf[mdf['VPUCode'].isna()]['TerminalLink'].values:
+                downstreams = list(G.successors(terminal_id))
+                while downstreams:
+                    downstream = downstreams.pop()
+                    if downstream in vpu_dict:
+                        mdf.loc[mdf['TerminalLink'] == terminal_id, 'VPUCode'] = vpu_dict[downstream]
+                        break
+                    downstreams = list(G.successors(downstream)) 
+                else:
+                    raise RuntimeError(f"Could not find VPU for terminal node {terminal_id}")
+        else:
+            mdf[mdf['VPUCode'].isna()].to_csv(os.path.join(os.path.dirname(master_table_path), 'missing_vpu_label.csv'))
+            raise RuntimeError('Some terminal nodes are not in the VPU table and must be fixed before continuing.')
     mdf['VPUCode'] = mdf['VPUCode'].astype(int)
 
     mdf[[
