@@ -8,6 +8,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from shapely.geometry import Point
 
 from .network import correct_0_length_streams
 from .network import create_directed_graphs
@@ -94,10 +95,15 @@ def rapid_master_files(streams_gpq: str,
     sgdf = gpd.read_parquet(streams_gpq).set_crs('epsg:4326')
     logging.info(f'\tNumber of streams: {sgdf.shape[0]}')
 
+    logger.info('\tCreating Directed Graph')
+    G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field)
+
     if not sgdf[sgdf[length_field] <= 0.01].empty:
         logger.info('\tRemoving 0 length segments')
         zero_length_fixes_df = identify_0_length(sgdf, id_field, ds_id_field, length_field)
         zero_length_fixes_df.to_csv(os.path.join(save_dir, 'mod_zero_length_streams.csv'), index=False)
+        nexus_df = generate_nexus_points(sgdf, zero_length_fixes_df, G, id_field)
+        nexus_df.to_file(os.path.join(save_dir, 'nexus_points.gpkg'), index=False)
         sgdf = correct_0_length_streams(sgdf, zero_length_fixes_df, id_field)
 
     # Fix basins with ID of 0
@@ -109,8 +115,7 @@ def rapid_master_files(streams_gpq: str,
             'centroid_y': sgdf[sgdf[id_field] == 0].centroid.y.values[0]
         }).to_csv(os.path.join(save_dir, 'mod_basin_zero_centroid.csv'), index=False)
 
-    logger.info('\tCreating Directed Graph')
-    G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field)
+    G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field) 
     sorted_order = sort_topologically(G)
     sgdf = (
         sgdf
@@ -127,84 +132,43 @@ def rapid_master_files(streams_gpq: str,
 
     if dissolve_lakes:
         logger.info('\tDissolving lakes')
-        lake_ids = set(pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv'))[id_field])
-
-        lake_ids_in_network_df = sgdf[sgdf[id_field].isin(lake_ids)]
-        lake_g = create_directed_graphs(lake_ids_in_network_df, id_field, ds_id_field=ds_id_field)
-
-        outlets = [int(node) for node, degree in lake_g.out_degree() if degree == 0]
-        dissolve_lake_dict: dict[int, dict[str, list]] = {}
-        streams_to_delete = set()
+        lake_csv = os.path.join(os.path.dirname(__file__), 'network_data', 'lakes.csv')
+        if not os.path.exists(lake_csv):
+            raise FileNotFoundError('Lake CSV not found')
         
-        for outlet in outlets:
-            lake_ancestors: set = nx.ancestors(lake_g, outlet)  # All nodes in lake that were in the CSV
+        lake_df = pd.read_csv(lake_csv).astype(int)
+        stream_ids = set(sgdf[id_field])
 
-            # Outlet may not be the true outlet of the lake. We need to find the true outlet
-            current_stream = outlet
-            prev_stream_was_straight = False
-            while current_stream:
-                downstream_list = list(G.successors(current_stream))
-                if not downstream_list:  # No more downstream nodes
-                    break
-                prev_stream = current_stream
-                current_stream = downstream_list[0]
-                if is_stream_a_straight_line(current_stream, id_field, sgdf):
-                    prev_stream_was_straight = True
-                    # Lake streams are straight lines. Let's eat them and move outlet
-                    lake_ancestors.add(prev_stream)
-                    lake_g.add_node(current_stream)
-                    lake_g.add_edge(prev_stream, current_stream)
-                    outlet = current_stream
-                else:
-                    if prev_stream_was_straight:
-                        # Let's eat the previous straight line, and the current node will be the new outlet
-                        lake_ancestors.add(prev_stream)
-                        lake_g.add_node(current_stream)
-                        lake_g.add_edge(prev_stream, current_stream)
-                        outlet = current_stream
-                    break
+        dissolve_lake_dict: dict[int, dict[str, list]] = {}
+        inlets = set()
+        to_remove = set()
+        lake_groups = lake_df.groupby('outlet')
+    
+        for outlet, group in lake_groups:
+            if outlet not in stream_ids:
+                continue
+            inlets = set(group['inlet'])
 
-            # Add initial inlet streams to the lake
-            # Any order 1 streams can be merged with lake
-            leaves = {node for node in lake_ancestors if lake_g.in_degree(node) == 0}
-            inlets = set()
-            inside_streams = lake_ancestors - leaves
-            for leaf in leaves:
-                if sgdf.loc[sgdf[id_field] == leaf, "strmOrder"].values[0] == 1:
-                    inside_streams.add(leaf)
-                else:
-                    inlets.add(leaf)
-
-            # Add streams that feed into the lake but are not in the lake
-            inlets.update({pred for n in inside_streams for pred in G.predecessors(n) if pred not in lake_ancestors})
-
-            streams_to_delete.update(inside_streams)
-            if outlet in dissolve_lake_dict:
-                dissolve_lake_dict[outlet]['inlets'].extend(list(inlets))
-                dissolve_lake_dict[outlet]['inside'].extend(list(inside_streams))
-            else:
-                dissolve_lake_dict[outlet] = {'inlets': list(inlets), 'inside': list(inside_streams)}
-
+            # Update sgdf for previous inlets
             sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = outlet
 
-        # We need to check that no outlets are lakes to delete
-        outlets = set(dissolve_lake_dict.keys())
-        for outlet in outlets:
-            if outlet in streams_to_delete:
-                # Find the real outlet
-                for key, items in dissolve_lake_dict.items():
-                    if outlet in items:
-                        break
-                real_outlet = key
-                dissolve_lake_dict[real_outlet]['inside'].extend(dissolve_lake_dict[outlet]['inside'])
-                dissolve_lake_dict[real_outlet]['inlets'].extend(dissolve_lake_dict[outlet]['inlets'])
-                del dissolve_lake_dict[outlet]
-                inlets = sgdf[sgdf[ds_id_field] == outlet][id_field]
-                sgdf.loc[sgdf[id_field].isin(inlets), ds_id_field] = real_outlet
+            # Compute ancestors and update to_remove
+            ancestors = nx.ancestors(G, outlet)
+            for inlet in inlets:
+                if inlet in stream_ids:
+                    inlet_ancestors = ancestors_safe(G, inlet) | {inlet}
+                    ancestors -= inlet_ancestors
+            to_remove.update(ancestors)
+
+            dissolve_lake_dict[outlet] = {
+                'inlets': list(inlets),
+                'inside': list(ancestors)
+            }
+
+        sgdf = sgdf[~sgdf[id_field].isin(to_remove)]
 
         with open(os.path.join(save_dir, 'mod_dissolve_lakes.json'), 'w') as f:
             json.dump(dissolve_lake_dict, f)
-        sgdf = sgdf[~sgdf[id_field].isin(streams_to_delete)]
 
         G = create_directed_graphs(sgdf, id_field, ds_id_field) # Need to recreate the graph after removing streams
 
@@ -379,6 +343,30 @@ def rapid_master_files(streams_gpq: str,
         streams_to_prune.to_csv(os.path.join(save_dir, 'mod_prune_streams.csv'), index=False)
         sgdf = prune_branches(sgdf, streams_to_prune)
 
+    if dissolve_lakes:
+        logger.info('\tUpdating Lengths for lake outlets')
+        stream_ids = set(sgdf[id_field])
+        lake_ids = lake_df['outlet'].unique()
+        # We are gonna udpate the k value for lakes
+        for outlet, group in lake_groups:
+            if outlet not in stream_ids:
+                continue
+
+            inlets = set(group['inlet'])
+            max_distance = 0
+            for inlet in inlets:
+                if inlet not in stream_ids:
+                    continue
+                # Calculate the straightline distance between outlet and inlet
+                outlet_geom = sgdf.loc[sgdf[id_field] == outlet, 'geometry'].values[0]
+                inlet_geom = sgdf.loc[sgdf[id_field] == inlet, 'geometry'].values[0]
+                distance = outlet_geom.distance(inlet_geom)
+                if distance > max_distance:
+                    max_distance = distance
+
+            sgdf.loc[sgdf[id_field] == outlet, 'LengthGeodesicMeters'] += max_distance
+                
+
     # length is in m, divide by estimated m/s to get k in seconds
     logger.info('\tCalculating Muskingum k and x')
     sgdf['velocity_factor'] = np.exp(0.16842 * np.log(sgdf['DSContArea']) - 4.68).round(3) \
@@ -390,13 +378,13 @@ def rapid_master_files(streams_gpq: str,
     sgdf["musk_x"] = default_x
 
     # set the k value for lakes
-    logger.info('\tSetting k and x values for lake rivers')
-    lake_ids = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv')).values.flatten()
-    logger.info(f'\tLake rivers found: {sgdf[sgdf["LINKNO"].isin(lake_ids)].shape[0]}')
-    sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'] = np.maximum(
-        sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'].values,
-        lake_min_k
-    )
+    # logger.info('\tSetting k and x values for lake rivers')
+    # lake_ids = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv')).values.flatten()
+    # logger.info(f'\tLake rivers found: {sgdf[sgdf["LINKNO"].isin(lake_ids)].shape[0]}')
+    # sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'] = np.maximum(
+    #     sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'].values,
+    #     lake_min_k
+    # )
     # set the x value to 0.01 for lakes (max attenuation while avoiding possible errors with 0.0)
     sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_x'] = 0.01
 
@@ -457,16 +445,30 @@ def rapid_master_files(streams_gpq: str,
     sgdf.drop(columns=['geometry', ]).to_parquet(os.path.join(save_dir, "rapid_inputs_master.parquet"))
     return
 
-def is_stream_a_straight_line(stream_id: int, id_field: str, sgdf: gpd.GeoDataFrame) -> bool:
-    # heck if the stream is a straight line
-    geom = sgdf[sgdf[id_field]==stream_id].geometry.values[0]
-    if len(geom.coords) <= 2:
-        return True  
+def ancestors_safe(G: nx.DiGraph, node: int) -> set:
+    try:
+        return nx.ancestors(G, node)
+    except nx.NetworkXError:
+        return set()
     
-    straight_line_len = ((np.asarray(geom.coords[-1]) - np.asarray(geom.coords[0])) ** 2).sum()
-    true_len = geom.length ** 2
+def generate_nexus_points(sgdf: gpd.GeoDataFrame, 
+                          zero_len_df: pd.DataFrame, 
+                          G: nx.DiGraph, 
+                          id_field: str = 'LINKNO',
+                          ds_id_field: str = 'DSLINKNO') -> gpd.GeoDataFrame:
+    nexus_streams=set(zero_len_df.loc[~zero_len_df[f'case2'].isna(), f'case2'].astype(int))
 
-    return abs(straight_line_len - true_len) < 1e-7
+    nexus_list = []
+    for nexus_id in nexus_streams:
+        stream_row = sgdf[sgdf[id_field] == nexus_id]
+        point = Point(stream_row['geometry'].values[0].coords[0])
+        downstream = sgdf[sgdf[id_field] == stream_row[ds_id_field].values[0]]
+        ds_strahler_order = downstream['strmOrder'].values[0]
+        upstreams = ",".join(map(str, G.predecessors(nexus_id)))
+        
+        nexus_list.append((nexus_id, point.y, point.x, downstream[id_field].values[0], ds_strahler_order, upstreams, point))
+
+    return gpd.GeoDataFrame(nexus_list, columns=[id_field, 'Lat', 'Lon', ds_id_field, 'DSStrahlerOrder', 'USLINKNOs', 'geometry'], crs=sgdf.crs)
 
 def dissolve_branches(sgdf: gpd.GeoDataFrame,
                       head_to_dissolve: pd.DataFrame,
