@@ -357,9 +357,9 @@ def rapid_master_files(streams_gpq: str,
             for inlet in inlets:
                 if inlet not in stream_ids:
                     continue
-                # Calculate the straightline distance between outlet and inlet
-                outlet_geom = sgdf.loc[sgdf[id_field] == outlet, 'geometry'].values[0]
-                inlet_geom = sgdf.loc[sgdf[id_field] == inlet, 'geometry'].values[0]
+                # Calculate the straightline distance between outlet and inlet, reprojecting to get meters
+                outlet_geom = sgdf.loc[sgdf[id_field] == outlet, 'geometry'].to_crs({'proj':'cea'}).values[0]
+                inlet_geom = sgdf.loc[sgdf[id_field] == inlet, 'geometry'].to_crs({'proj':'cea'}).values[0]
                 distance = outlet_geom.distance(inlet_geom)
                 if distance > max_distance:
                     max_distance = distance
