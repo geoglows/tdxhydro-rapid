@@ -27,6 +27,7 @@ __all__ = [
     'rapid_input_csvs',
     'concat_tdxregions',
     'vpu_files_from_masters',
+    'create_directed_graphs'
 ]
 
 def rapid_master_files(streams_gpq: str,
@@ -102,8 +103,6 @@ def rapid_master_files(streams_gpq: str,
         logger.info('\tRemoving 0 length segments')
         zero_length_fixes_df = identify_0_length(sgdf, id_field, ds_id_field, length_field)
         zero_length_fixes_df.to_csv(os.path.join(save_dir, 'mod_zero_length_streams.csv'), index=False)
-        nexus_df = generate_nexus_points(sgdf, zero_length_fixes_df, G, id_field)
-        nexus_df.to_file(os.path.join(save_dir, 'nexus_points.gpkg'), index=False)
         sgdf = correct_0_length_streams(sgdf, zero_length_fixes_df, id_field)
 
     # Fix basins with ID of 0
@@ -365,7 +364,6 @@ def rapid_master_files(streams_gpq: str,
                     max_distance = distance
 
             sgdf.loc[sgdf[id_field] == outlet, 'LengthGeodesicMeters'] += max_distance
-                
 
     # length is in m, divide by estimated m/s to get k in seconds
     logger.info('\tCalculating Muskingum k and x')
@@ -386,7 +384,8 @@ def rapid_master_files(streams_gpq: str,
     #     lake_min_k
     # )
     # set the x value to 0.01 for lakes (max attenuation while avoiding possible errors with 0.0)
-    sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_x'] = 0.01
+    if dissolve_lakes:
+        sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_x'] = 0.01
 
     if merge_short_streams:
         logging.info('\tFinding small k value streams to merge')
@@ -450,25 +449,6 @@ def ancestors_safe(G: nx.DiGraph, node: int) -> set:
         return nx.ancestors(G, node)
     except nx.NetworkXError:
         return set()
-    
-def generate_nexus_points(sgdf: gpd.GeoDataFrame, 
-                          zero_len_df: pd.DataFrame, 
-                          G: nx.DiGraph, 
-                          id_field: str = 'LINKNO',
-                          ds_id_field: str = 'DSLINKNO') -> gpd.GeoDataFrame:
-    nexus_streams=set(zero_len_df.loc[~zero_len_df[f'case2'].isna(), f'case2'].astype(int))
-
-    nexus_list = []
-    for nexus_id in nexus_streams:
-        stream_row = sgdf[sgdf[id_field] == nexus_id]
-        point = Point(stream_row['geometry'].values[0].coords[0])
-        downstream = sgdf[sgdf[id_field] == stream_row[ds_id_field].values[0]]
-        ds_strahler_order = downstream['strmOrder'].values[0]
-        upstreams = ",".join(map(str, G.predecessors(nexus_id)))
-        
-        nexus_list.append((nexus_id, point.y, point.x, downstream[id_field].values[0], ds_strahler_order, upstreams, point))
-
-    return gpd.GeoDataFrame(nexus_list, columns=[id_field, 'Lat', 'Lon', ds_id_field, 'DSStrahlerOrder', 'USLINKNOs', 'geometry'], crs=sgdf.crs)
 
 def dissolve_branches(sgdf: gpd.GeoDataFrame,
                       head_to_dissolve: pd.DataFrame,
