@@ -2,6 +2,7 @@ import logging
 import os
 import warnings
 import json
+from typing import Generator, Union
 
 import geopandas as gpd
 import numpy as np
@@ -18,6 +19,7 @@ __all__ = [
     'make_weight_table_from_thiessen_grid',
     'make_weight_table_from_netcdf',
     'apply_weight_table_simplifications',
+    'get_expected_weight_tables'
 ]
 
 
@@ -292,3 +294,32 @@ def apply_weight_table_simplifications(save_dir: str,
     wt = wt.sort_values([id_field, 'area_sqm'], ascending=[True, False])
     wt.to_csv(weight_table_out_path, index=False)
     return
+
+def get_weight_table_name_from_grid(grid: Union[str, gpd.GeoDataFrame], warn=False) -> str:
+    if isinstance(grid, str):
+        gpq = gpd.read_parquet(grid)
+    else:
+        gpq = grid
+    dxs = gpq['lon'].round(12).drop_duplicates().sort_values().diff().dropna().unique()
+    if len(dxs) > 1:
+        if warn: logger.warning(f'Multiple dx values found in {grid}, using median')
+        dx = round(np.median(dys), 12)
+    else:
+        dx = round(dxs[0], 12)
+
+    dys = gpq['lat'].round(12).drop_duplicates().sort_values().diff().dropna().unique()
+    if len(dys) > 1:
+        if warn: logger.warning(f'Multiple dy values found in {grid}, using median')
+        dy = round(np.median(dys), 12)
+    else:
+        dy = round(dys[0], 12)
+    
+    xinit = gpq['lon'].round(12).min()
+    yinit = gpq['lat'].round(12).min()
+    
+    return f"weight_xinit={xinit}_yinit={yinit}_dx={dx}_dy={dy}_.csv"
+
+def get_expected_weight_tables(sample_grids: list[str], warn=False) -> Generator[str, None, None]:
+    for grid in sample_grids:
+        yield get_weight_table_name_from_grid(grid, warn)
+

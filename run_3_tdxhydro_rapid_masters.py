@@ -6,6 +6,7 @@ import traceback
 import warnings
 
 import pandas as pd
+import geopandas as gpd
 
 import tdxhydrorapid as rp
 
@@ -41,6 +42,8 @@ gis_iterable = zip(
     sorted(glob.glob(os.path.join(inputs_path, f'TDX_streamnet_{region_select}.parquet')), reverse=False),
     sorted(glob.glob(os.path.join(inputs_path, f'TDX_streamreach_basins_{region_select}.parquet')), reverse=False),
 )
+
+read_grids = [gpd.read_parquet(g) for g in sample_grids]
 
 for streams_gpq, basins_gpq in gis_iterable:
     region_num = os.path.basename(streams_gpq)
@@ -86,7 +89,8 @@ for streams_gpq, basins_gpq in gis_iterable:
     try:
         # make the master rapid input files
         if not os.path.exists(os.path.join(save_dir, 'rapid_inputs_master.parquet')) or \
-                (CACHE_GEOMETRY and not len(list(glob.glob(os.path.join(save_dir, '*.geoparquet'))))):
+                (CACHE_GEOMETRY and not len(list(glob.glob(os.path.join(save_dir, '*.geoparquet'))))) or \
+                not os.path.exists(os.path.join(save_dir, 'rapid_inputs_master.parquet')):
             rp.inputs.rapid_master_files(streams_gpq,
                                         save_dir=save_dir, id_field=id_field, ds_id_field=ds_field,
                                         length_field=length_field,
@@ -120,9 +124,7 @@ for streams_gpq, basins_gpq in gis_iterable:
 
         # make the master weight tables
         basins_gdf = None
-        expect_tables = [f'weight_{os.path.basename(f)}' for f in sample_grids]
-        expect_tables = [f.replace('_thiessen_grid.parquet', '_full.csv') for f in expect_tables]
-        expect_tables = [os.path.join(save_dir, f) for f in expect_tables]
+        expect_tables = {os.path.join(save_dir, f.replace('.csv', '_full.csv')) for f in rp.weights.get_expected_weight_tables(read_grids, True)}
         if not all([os.path.exists(f) for f in expect_tables]):
             logging.info('Reading basins')
             basins_gdf = rp.network.correct_0_length_basins(basins_gpq,
@@ -139,8 +141,8 @@ for streams_gpq, basins_gpq in gis_iterable:
                                                                 basins_gdf=basins_gdf,
                                                                 id_field=id_field)
 
-        for weight_table in glob.glob(os.path.join(save_dir, 'weight*full.csv')):
-            out_path = weight_table.replace('_full.csv', '.csv')
+        for weight_table in expect_tables:
+            out_path = weight_table.replace('__full.csv', '.csv')
 
             if os.path.exists(out_path):
                 logging.info(f'Weight table already exists: {os.path.basename(out_path)}')
