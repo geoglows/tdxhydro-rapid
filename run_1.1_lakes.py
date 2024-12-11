@@ -8,6 +8,7 @@ import tqdm
 import geopandas as gpd
 import pandas as pd
 import dask_geopandas as dgpd
+from shapely.geometry import Polygon, MultiPolygon
 
 
 logging.basicConfig(
@@ -17,8 +18,8 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-lakes_parquet = '/Users/ricky/Downloads/GLAKES/all_lakes_filtered.parquet'
-gpq_dir = '/Volumes/EB406_T7_3/geoglows_v3/parquets'
+lakes_parquet = '/Users/ricky/Downloads/GLAKES/all_lakes_filtered.parquet' # https://garslab.com/?p=234 August 24, 2022
+gpq_dir = '/Volumes/EB406_T7_3/geoglows_v3/parquets*'
 save_dir = './tdxhydrorapid/network_data/'
 
 def create_directed_graphs(df: gpd.GeoDataFrame,
@@ -28,17 +29,33 @@ def create_directed_graphs(df: gpd.GeoDataFrame,
     G.add_nodes_from(df[id_field].values)
     return G
 
+def fill_holes(geometry):
+    """
+    Removes holes from a Polygon or MultiPolygon geometry.
+    """
+    if isinstance(geometry, Polygon):
+        # Remove holes by keeping only the exterior
+        return Polygon(geometry.exterior)
+    elif isinstance(geometry, MultiPolygon):
+        # Process each Polygon in the MultiPolygon
+        return MultiPolygon([Polygon(poly.exterior) for poly in geometry.geoms])
+    return geometry  # Return as-is for non-polygon geometries (if any)
+
 if __name__ == "__main__":
-    logging.info('Getting Lake CSV')
+    logging.info('Getting Lake Polygons')
+    
     lakes_gdf = gpd.read_parquet(lakes_parquet)
-    lakes_gdf = lakes_gdf[lakes_gdf['Area_PW'] > 0.4]
+    lakes_gdf = lakes_gdf[lakes_gdf['Area_PW'] > 1]
+    lakes_gdf['geometry'] = lakes_gdf['geometry'].apply(fill_holes) # Remove holes from lakes, could lead to issues...
+
     values_list = []
     pqs = glob.glob(os.path.join(gpq_dir, 'TDX_streamnet*.parquet'))
-    #pqs = ['/Volumes/EB406_T7_3/geoglows_v3/parquets/TDX_streamnet_7020000010_01.parquet']
     for pq in tqdm.tqdm(pqs):
+        global_outlets = set()
+        global_inlets = set()
+        global_inside = set()
         gdf = gpd.read_parquet(pq)
         G = create_directed_graphs(gdf)
-        strm_order_dict: dict[int, int] = gdf.set_index('LINKNO')['strmOrder'].to_dict()
         
         # Get all streams that intersect with a lake
         bounds = gdf.total_bounds
@@ -50,12 +67,17 @@ if __name__ == "__main__":
             continue
 
         intersect = intersect.drop(columns=['index_right'])
-        geom_dict: dict[int, int] = gdf[gdf['LINKNO'].isin(intersect['LINKNO'])].set_index('LINKNO')['geometry'].to_dict()
         lakes_g = create_directed_graphs(intersect)
         intersect = intersect.set_index('LINKNO')
 
+        # Make looking these up O(1)
+        lake_id_dict: dict[int, int] = intersect['Lake_id'].to_dict()
+        lake_polygon_dict: dict[int, Polygon] = lakes_subset.set_index('Lake_id')['geometry'].to_dict() 
+        geom_dict: dict[int, Polygon] = gdf.set_index('LINKNO')['geometry'].to_dict()
+
         # Get connected components
         for lake_ids in nx.weakly_connected_components(lakes_g):
+            extra_inlets = set()
             # Get sink
             outlets = [node for node in lake_ids if lakes_g.out_degree(node) == 0]
             if len(outlets) != 1:
@@ -74,16 +96,48 @@ if __name__ == "__main__":
                         outlet = pred
                         break        
 
+            if outlet in global_inlets:
+                # Ah! The outlet really should be the outlet of another lake
+                new_outlets = [v for v in values_list if v[0] == outlet]
+                if len(new_outlets) != 1 and not all(x[:2] == new_outlets[0][:2] for x in new_outlets):
+                    raise RuntimeError(f'Outlet {outlet} is in multiple lakes')
+                
+                extra_inlets = {v[0] for v in values_list if v[1] == new_outlets[0][1]} - {outlet}
+                # Remove the old outlet
+                values_list = [v for v in values_list if v[0] != outlet]
+                
+                for inlet in extra_inlets:
+                    lake_id_dict[inlet] = lake_id_dict.get(new_outlets[0][1], lake_id_dict.get(outlet))
+                outlet = new_outlets[0][1]
+                
+            if outlet in global_inside:
+                # This is already taken care of
+                continue
+
             # Get all inlets
-            inlets = {node for node in lake_ids if lakes_g.in_degree(node) == 0}
+            inlets = {node for node in lake_ids if lakes_g.in_degree(node) == 0} | extra_inlets
             if outlet in inlets or len(lake_ids - inlets - {outlet}) == 0:
                 # Small lake, skip
                 continue
 
+            # Choosing inlets based on in_degree can miss segments that have one upstream segment that is an inlet, but another upstream that was not in the intersection.
+            # Let's find and add these inlets
+            to_test = lake_ids - inlets - {outlet}
+            for river in to_test:
+                preds = set(G.predecessors(river))
+                preds_remaining = list(preds - lake_ids)
+                if len(preds) == 2 and len(preds_remaining) == 1 and len(preds - inlets) == 1 and preds_remaining[0] != outlet:
+                    # Add the other pred
+                    inlet_to_be = preds_remaining[0]
+                    if inlet_to_be in global_inside or inlet_to_be in global_outlets:
+                        # This stream is already in a lake
+                        continue
+                    inlets.add(inlet_to_be)
+                    other_pred = (preds - {inlet_to_be}).pop()
+                    lake_id_dict[inlet_to_be] = lake_id_dict.get(river, lake_id_dict.get(other_pred))
+
             # Add any direct predecessors of inlets that have strmOrder == 1
             new_inlets = set()
-            lake_id_dict: dict[int, int] = intersect.loc[intersect.index.isin(lake_ids), 'Lake_id'].to_dict()
-            lake_polygon_dict = lakes_subset[lakes_subset['Lake_id'].isin(intersect.loc[intersect.index.isin(lake_ids), 'Lake_id'].unique())].set_index('Lake_id')['geometry'].to_dict()
             for inlet in inlets:
                 preds = set(G.predecessors(inlet))
                 if not preds:
@@ -109,14 +163,23 @@ if __name__ == "__main__":
                 # Not worth making a lake
                 continue
 
-            
+            global_inlets.update(new_inlets)
+            global_outlets.add(outlet)
+            outlet_ans = nx.ancestors(G, outlet)
+            for inlet in new_inlets:
+                outlet_ans -= nx.ancestors(G, inlet) | {inlet}
+            global_inside.update(outlet_ans)
+
             for inlet in new_inlets:
                 values_list.append((inlet, outlet, lake_id_dict[inlet]))
 
     df = pd.DataFrame(values_list, columns=['inlet', 'outlet', 'lake_id'])
+    df = df.drop_duplicates() # Sometimes we get duplicate entries, not sure why
+    
     # gdf['type'] = ""
     # gdf.loc[gdf['LINKNO'].isin(df['inlet']), 'type'] = 'inlet'
     # gdf.loc[gdf['LINKNO'].isin(df['outlet']), 'type'] = 'outlet'
     # gdf[gdf['type'] != ''].to_file('inlets_outlets.gpkg')
-    out_name = os.path.join(save_dir, 'lakes.csv')
+    out_name = os.path.join(save_dir, 'lake_table.csv')
     df.to_csv(out_name, index=False)
+    logging.info(f'Saved lakes to {out_name}')
