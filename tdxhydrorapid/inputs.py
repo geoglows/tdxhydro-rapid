@@ -3,8 +3,12 @@ import json
 import logging
 import os
 import types
+import threading
+from typing import Union
 
 import geopandas as gpd
+import dask.dataframe as dd
+import dask_geopandas as dgpd
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -25,6 +29,7 @@ __all__ = [
     'dissolve_branches',
     'prune_branches',
     'rapid_input_csvs',
+    'river'
     'concat_tdxregions',
     'vpu_files_from_masters',
     'create_directed_graphs'
@@ -100,6 +105,11 @@ def rapid_master_files(streams_gpq: str,
     G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field)
 
     if not sgdf[sgdf[length_field] <= 0.01].empty:
+        logger.info('\tSaving nexus points')
+        nexus_file = os.path.join(save_dir, 'nexus_points.gpkg')
+        if not os.path.exists(nexus_file):
+            create_nexus_points(sgdf, nexus_file, id_field, ds_id_field)
+
         logger.info('\tRemoving 0 length segments')
         zero_length_fixes_df = identify_0_length(sgdf, id_field, ds_id_field, length_field)
         zero_length_fixes_df.to_csv(os.path.join(save_dir, 'mod_zero_length_streams.csv'), index=False)
@@ -131,7 +141,7 @@ def rapid_master_files(streams_gpq: str,
 
     if dissolve_lakes:
         logger.info('\tDissolving lakes')
-        lake_csv = os.path.join(os.path.dirname(__file__), 'network_data', 'lakes.csv')
+        lake_csv = os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv')
         if not os.path.exists(lake_csv):
             raise FileNotFoundError('Lake CSV not found')
         
@@ -444,6 +454,31 @@ def rapid_master_files(streams_gpq: str,
     sgdf.drop(columns=['geometry', ]).to_parquet(os.path.join(save_dir, "rapid_inputs_master.parquet"))
     return
 
+def create_nexus_points(gdf: gpd.GeoDataFrame, 
+                        nexus_file: str, 
+                        id_field: str = 'LINKNO', 
+                        ds_id_field: str = 'DSLINKNO') -> None:
+    nexus_list = []
+    for river_id in gdf[gdf['LengthGeodesicMeters'] <= 0.01][id_field].values:
+        feat = gdf[gdf[id_field] == river_id]
+        upstreams = set(gdf[gdf[ds_id_field] == river_id][id_field])
+        if not feat[ds_id_field].values != -1 and all([x != -1 for x in upstreams]):
+            continue
+
+        stream_row = gdf[gdf[id_field] == river_id]
+        point = Point(stream_row['geometry'].values[0].coords[0])
+        downstream = gdf[gdf[id_field] == stream_row[ds_id_field].values[0]]
+        ds_strahler_order = downstream['strmOrder'].values[0]
+        upstreams = ",".join(map(str, upstreams))
+        
+        nexus_list.append((river_id, point.y, point.x, downstream[id_field].values[0], ds_strahler_order, upstreams, point))
+
+    if nexus_list:
+        gpd.GeoDataFrame(nexus_list, columns=['LINKNO', 'Lat', 'Lon', 'DSLINKNO', 'DSStrahlerOrder', 'USLINKNOs', 'geometry'], crs=gdf.crs).to_file(nexus_file, index=False)
+    else:
+        logger.info('No Nexus Points Found')
+
+
 def ancestors_safe(G: nx.DiGraph, node: int) -> set:
     try:
         return nx.ancestors(G, node)
@@ -593,6 +628,41 @@ def rapid_input_csvs(sdf: pd.DataFrame,
     sdf[['LINKNO', 'lat', 'lon', 'z']].to_csv(os.path.join(save_dir, "comid_lat_lon_z.csv"), index=False)
     return
 
+def river_route_inputs(sdf: pd.DataFrame,
+                     save_dir: str,
+                     id_field: str = 'LINKNO',
+                     ds_id_field: str = 'DSLINKNO', ) -> None:
+    """
+    Create river route input files from a stream network dataframe
+
+    Produces the following files:
+
+    Args:
+        sdf: stream network dataframe
+        save_dir: directory to save the regions outputs
+        id_field: the field in the dataframe that contains the unique ID for each stream
+        ds_id_field: the field in the dataframe that contains the unique ID for the downstream stream
+
+    Returns:
+
+    """
+    logger.info('\tWriting Connectivity Parquet')
+    (
+        sdf
+        [[id_field, ds_id_field]]
+        .rename(columns={id_field: 'river_id', ds_id_field: 'ds_river_id'})
+        .to_parquet(os.path.join(save_dir, 'connectivity.parquet'))
+    )
+
+    logger.info('\tWriting Routing Parameters')
+    (
+        sdf
+        [[id_field, 'musk_x', 'musk_k']]
+        .rename(columns={id_field:'river_id', 'musk_x':'x', 'musk_k':'k'})
+        .to_parquet(os.path.join(save_dir, 'routing_parameters.parquet'))
+    )
+    
+    return
 
 def concat_tdxregions(tdxinputs_dir: str, vpu_assignment_table: str, master_table_path: str, original_streams: list[str] = None) -> None:
     """
@@ -608,25 +678,26 @@ def concat_tdxregions(tdxinputs_dir: str, vpu_assignment_table: str, master_tabl
 
     if not mdf[mdf['VPUCode'].isna()].empty:
         if original_streams is not None:
-            graphs = []
-            for pq in original_streams:
-                graphs.append(create_directed_graphs(pd.read_parquet(pq, columns=['LINKNO', 'DSLINKNO']), 'LINKNO', ds_id_field='DSLINKNO'))
-            G: nx.DiGraph = nx.compose_all(graphs)
+            gdf = dd.read_parquet(original_streams, columns=['LINKNO', 'DSLINKNO']).compute()
+            G = create_directed_graphs(gdf, 'LINKNO', ds_id_field='DSLINKNO')
 
-            for terminal_id, vpu in vpu_df.values:
-                mdf.loc[mdf['TerminalLink'] == terminal_id, 'VPUCode'] = vpu
+            mapping = {terminal_id: vpu for terminal_id, vpu in vpu_df.values}
+            mdf['VPUCode'] = mdf['TerminalLink'].map(mapping).fillna(mdf['VPUCode'])
 
+            mapping = {}
             vpu_dict = vpu_df.set_index('TerminalLink')['VPUCode'].to_dict() # Allows for quick lookup
             for terminal_id in mdf[mdf['VPUCode'].isna()]['TerminalLink'].values:
                 downstreams = list(G.successors(terminal_id))
                 while downstreams:
                     downstream = downstreams.pop()
                     if downstream in vpu_dict:
-                        mdf.loc[mdf['TerminalLink'] == terminal_id, 'VPUCode'] = vpu_dict[downstream]
+                        mapping[terminal_id] = vpu_dict[downstream]
                         break
                     downstreams = list(G.successors(downstream)) 
                 else:
                     raise RuntimeError(f"Could not find VPU for terminal node {terminal_id}")
+                
+            mdf['VPUCode'] = mdf['TerminalLink'].map(mapping).fillna(mdf['VPUCode'])
         else:
             mdf[mdf['VPUCode'].isna()].to_csv(os.path.join(os.path.dirname(master_table_path), 'missing_vpu_label.csv'))
             raise RuntimeError('Some terminal nodes are not in the VPU table and must be fixed before continuing.')
@@ -648,17 +719,21 @@ def concat_tdxregions(tdxinputs_dir: str, vpu_assignment_table: str, master_tabl
     ]].to_parquet(master_table_path)
     return
 
-
 def vpu_files_from_masters(vpu_df: pd.DataFrame,
                            vpu_dir: str,
                            tdxinputs_directory: str,
                            make_gpkg: bool,
-                           gpkg_dir: str, ) -> None:
+                           gpkg_dir: str, 
+                           use_rapid: bool = False,
+                           vpu_boundaries: Union[gpd.GeoDataFrame, None] = None) -> None:
     tdx_region = vpu_df['TDXHydroRegion'].values[0]
     vpu = vpu_df['VPUCode'].values[0]
 
     # make the rapid input files
-    rapid_input_csvs(vpu_df, vpu_dir)
+    if use_rapid:
+        rapid_input_csvs(vpu_df, vpu_dir)
+    else:
+        river_route_inputs(vpu_df, vpu_dir)
 
     # subset the weight tables
     logging.info('Subsetting weight tables')
@@ -675,15 +750,51 @@ def vpu_files_from_masters(vpu_df: pd.DataFrame,
     altered_network = os.path.join(tdxinputs_directory, tdx_region, f'{tdx_region}_altered_network.geoparquet')
     vpu_network = os.path.join(gpkg_dir, f'streams_{vpu}.gpkg')
     if os.path.exists(altered_network):
-        (
-            gpd
-            .read_parquet(altered_network)
+        gdf = (
+            gpd.read_parquet(altered_network)
             .merge(vpu_df, on='LINKNO', how='inner')
-            .set_crs('epsg:4326')
-            .to_crs('epsg:3857')
-            .to_file(vpu_network, driver='GPKG')
         )
+        # Saving (and updating CRS of) the GPKG in another thread saves lots of time
+        save_thread = threading.Thread(target=make_vpu_gpkg, args=(gdf, vpu_network))
+        save_thread.start()
+
+    nexus_region_file = os.path.join(tdxinputs_directory, tdx_region, 'nexus_points.gpkg')
+    if os.path.exists(nexus_region_file) and vpu_boundaries is not None:
+        # Create an enevlope of the current VPU
+        vpu_boundary = vpu_boundaries[vpu_boundaries['VPU'] == str(vpu)]
+        nexus_file = os.path.join(gpkg_dir, f'nexus_{vpu}.gpkg')
+        nexus_df = gpd.read_file(nexus_region_file)
+
+        # Filter the nexus points to the VPU boundary
+        vpu_bounds = vpu_boundary.total_bounds
+        nexus_df = nexus_df.cx[vpu_bounds[0]:vpu_bounds[2], vpu_bounds[1]:vpu_bounds[3]]
+        nexus_df: dgpd.GeoDataFrame = dgpd.from_geopandas(nexus_df, npartitions=os.cpu_count()*2)
+        nexus_df = nexus_df[nexus_df.within(vpu_boundary.geometry.values[0])].compute()
+
+        if nexus_df.empty:
+            if os.path.exists(altered_network):
+                save_thread.join()
+            return
+        
+        logging.info('Making nexus points')
+        (
+            nexus_df
+            .to_crs('epsg:3857')
+            .to_file(nexus_file, driver='GPKG')
+        )
+
+    if os.path.exists(altered_network):
+        save_thread.join()
+
     return
+
+def make_vpu_gpkg(df: gpd.GeoDataFrame, vpu_network: str) -> None:
+    (
+        df            
+        .set_crs('epsg:4326')
+        .to_crs('epsg:3857')
+        .to_file(vpu_network, driver='GPKG')
+    )  
 
 
 def _k_agg_order_3(x: pd.Series) -> np.ndarray:

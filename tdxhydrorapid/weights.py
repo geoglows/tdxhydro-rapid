@@ -68,6 +68,9 @@ def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, out_dir: str, ) -> No
         tg_gdf['lon_index'] = tg_gdf['lon'].apply(lambda x: np.argmin(np.abs(all_xs - x)))
         tg_gdf['lat_index'] = tg_gdf['lat'].apply(lambda y: np.argmin(np.abs(all_ys - y)))
 
+    # Remove invalid geometries
+    tg_gdf = tg_gdf[tg_gdf['lon'].between(-180, 180) & tg_gdf['lat'].between(-90, 90)]
+
     # save the thiessen grid to disc
     logging.info('\tSaving Thiessen grid to disc')
     tg_gdf.to_parquet(new_file_name)
@@ -88,16 +91,16 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
                                          out_dir: str,
                                          basins_gdf: gpd.GeoDataFrame,
                                          id_field: str = 'LINKNO') -> None:
-    weight_file_name = os.path.basename(tg_parquet).replace('_thiessen_grid.parquet', '_full.csv')
-    out_name = os.path.join(out_dir, f'weight_{weight_file_name}')
+    # load the thiessen grid
+    logger.info('\tloading thiessen grid')
+    tg_gdf = gpd.read_parquet(tg_parquet)
+
+    weight_file_name = get_weight_table_name_from_grid(tg_gdf).replace('.csv', '_full.csv')
+    out_name = os.path.join(out_dir, weight_file_name)
     if os.path.exists(os.path.join(out_dir, out_name)):
         logger.info(f'Weight table already exists: {os.path.basename(out_name)}')
         return
     logger.info(f'Creating weight table: {os.path.basename(out_name)}')
-
-    # load the thiessen grid
-    logger.info('\tloading thiessen grid')
-    tg_gdf = gpd.read_parquet(tg_parquet)
 
     # filter the thiessen grid to only include points within the basins bounding box
     logger.info('\tfiltering thiessen grid by bounding box')

@@ -3,6 +3,8 @@ import logging
 import os
 
 import geopandas as gpd
+import dask_geopandas as dgpd
+import dask.dataframe as dd
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -348,33 +350,61 @@ def make_final_streams(final_inputs_directory: str,
         mgdf[mgdf['VPUCode'] == vpu_code].to_file(file_path)
     return
 
-def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame, fs,  id_field: str = 'LINKNO') -> gpd.GeoDataFrame:
+def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame,  id_field: str = 'LINKNO') -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
-    if fs.exists(headwater_dissolve_path):
-        with fs.open(headwater_dissolve_path) as f:
+
+    if os.path.exists(headwater_dissolve_path):
+        with open(headwater_dissolve_path) as f:
             o2_to_dissolve = pd.read_csv(f).fillna(-1).astype(int)
+        updates = {}
         for streams_to_merge in o2_to_dissolve.values:
-            gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+            valid_streams = streams_to_merge[streams_to_merge != -1]
+            updates.update({stream: valid_streams[0] for stream in valid_streams})
+
+        gdf[id_field] = gdf[id_field].map(updates).fillna(gdf[id_field]).astype(int)
 
     streams_to_prune_path = os.path.join(save_dir, 'mod_prune_streams.csv')
-    if fs.exists(streams_to_prune_path):
-        with fs.open(streams_to_prune_path) as f:
-            ids_to_prune = pd.read_csv(f).astype(int).set_index('LINKTODROP')
-        gdf[id_field] = gdf[id_field].replace(ids_to_prune['LINKNO'])
+    if os.path.exists(streams_to_prune_path):
+        with open(streams_to_prune_path) as f:
+            ids_to_prune = pd.read_csv(f).astype(int).set_index('LINKTODROP')['LINKNO'].to_dict()
+        gdf[id_field] = gdf[id_field].map(ids_to_prune).fillna(gdf[id_field]).astype(int)
 
     drop_streams_path = os.path.join(save_dir, 'mod_drop_small_trees.csv')
-    if fs.exists(drop_streams_path):
-        with fs.open(drop_streams_path) as f:
+    if os.path.exists(drop_streams_path):
+        with open(drop_streams_path) as f:
             ids_to_drop = pd.read_csv(f).astype(int)
         gdf = gdf[~gdf[id_field].isin(ids_to_drop.values.flatten())]
+        
 
     short_streams_path = os.path.join(save_dir, 'mod_merge_short_streams.csv')
-    if fs.exists(short_streams_path):
-        with fs.open(short_streams_path) as f:
+    if os.path.exists(short_streams_path):
+        with open(short_streams_path) as f:
             short_streams = pd.read_csv(f).astype(int)
         for streams_to_merge in short_streams.values:
             gdf.loc[gdf[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
 
+    lake_streams_path = os.path.join(save_dir, 'mod_dissolve_lakes.json')
+    lake_outlets = set()
+    if os.path.exists(lake_streams_path):
+        lake_streams_df = pd.read_json(lake_streams_path, orient='index', convert_axes=False, convert_dates=False)
+        streams_to_delete = set()
+        for outlet, _, lake_streams in lake_streams_df.itertuples():
+            outlet = int(outlet)
+            lake_outlets.add(outlet)
+            if outlet in gdf[id_field].values:
+                gdf.loc[gdf[id_field].isin(lake_streams), id_field] = outlet
+            else:
+                streams_to_delete.update(lake_streams)
+
+        gdf = gdf[~gdf[id_field].isin(streams_to_delete)]
+
     # dissolve the geometries based on shared value in the id field
-    gdf = gdf.dissolve(by=id_field).reset_index()
-    return gdf
+    logging.info('\tDissolving catchments')
+    dgdf: dd.DataFrame = dd.from_pandas(gdf, npartitions=os.cpu_count()*2)
+    dgdf: dgpd.GeoDataFrame = dgpd.from_dask_dataframe(dgdf.shuffle(on=id_field))
+    gdf = dgdf.dissolve(by=id_field).compute().reset_index()
+    if lake_outlets:
+        lake_gdf = gdf[gdf[id_field].isin(lake_outlets)]
+    else:
+        lake_gdf = gpd.GeoDataFrame()
+    return gdf, lake_gdf
