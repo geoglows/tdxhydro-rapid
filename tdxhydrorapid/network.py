@@ -44,7 +44,6 @@ def find_headwater_branches_to_dissolve(sdf: gpd.GeoDataFrame,
                                         id_field: str = 'LINKNO', ) -> pd.DataFrame:
     # select rows where the number of predecessors in the graph is 2+ and 2+ of them and 2+ are min_order_to_keep - 1
     # todo parameterize the column names
-    # order1 = sdf[sdf['strmOrder'] == (min_order_to_keep - 1)]['LINKNO'].values.flatten()
     candidate_streams = sdf[sdf[stream_order_field] == min_order_to_keep]
 
     stream_orders_dict = sdf[[id_field, stream_order_field]].set_index(id_field)[stream_order_field].to_dict()
@@ -65,7 +64,7 @@ def find_headwater_branches_to_dissolve(sdf: gpd.GeoDataFrame,
             continue
         more_candidates.add(stream_id)
 
-    # order2 = order2[order2[us_cols].isin(order1).sum(axis=1) >= 2]
+    candidate_streams = candidate_streams[candidate_streams[id_field].isin(more_candidates)]
     candidate_streams = candidate_streams[['LINKNO', ]]
 
     # get a dictionary of all streams upstream of the new headwater streams
