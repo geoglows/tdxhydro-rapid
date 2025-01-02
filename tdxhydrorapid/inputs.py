@@ -20,6 +20,7 @@ from .network import find_branches_to_prune
 from .network import find_headwater_branches_to_dissolve
 from .network import identify_0_length
 from .network import sort_topologically
+from .network import estimate_num_partition
 
 # set up logging
 logger = logging.getLogger(__name__)
@@ -101,9 +102,6 @@ def rapid_master_files(streams_gpq: str,
     sgdf = gpd.read_parquet(streams_gpq).set_crs('epsg:4326')
     logging.info(f'\tNumber of streams: {sgdf.shape[0]}')
 
-    logger.info('\tCreating Directed Graph')
-    G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field)
-
     if not sgdf[sgdf[length_field] <= 0.01].empty:
         logger.info('\tSaving nexus points')
         nexus_file = os.path.join(save_dir, 'nexus_points.gpkg')
@@ -123,7 +121,8 @@ def rapid_master_files(streams_gpq: str,
             'centroid_x': sgdf[sgdf[id_field] == 0].centroid.x.values[0],
             'centroid_y': sgdf[sgdf[id_field] == 0].centroid.y.values[0]
         }).to_csv(os.path.join(save_dir, 'mod_basin_zero_centroid.csv'), index=False)
-
+    
+    logger.info('\tCreating Directed Graph')
     G = create_directed_graphs(sgdf, id_field, ds_id_field=ds_id_field) 
     sorted_order = sort_topologically(G)
     sgdf = (
@@ -385,14 +384,6 @@ def rapid_master_files(streams_gpq: str,
     sgdf['musk_k'] = sgdf['musk_k'].clip(lower=0, upper=100_000)
     sgdf["musk_x"] = default_x
 
-    # set the k value for lakes
-    # logger.info('\tSetting k and x values for lake rivers')
-    # lake_ids = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv')).values.flatten()
-    # logger.info(f'\tLake rivers found: {sgdf[sgdf["LINKNO"].isin(lake_ids)].shape[0]}')
-    # sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'] = np.maximum(
-    #     sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_k'].values,
-    #     lake_min_k
-    # )
     # set the x value to 0.01 for lakes (max attenuation while avoiding possible errors with 0.0)
     if dissolve_lakes:
         sgdf.loc[sgdf['LINKNO'].isin(lake_ids), 'musk_x'] = 0.01
@@ -406,7 +397,8 @@ def rapid_master_files(streams_gpq: str,
         for river in sgdf.loc[sgdf['musk_k'] < min_k_value, id_field].values:
             # this river is a confluence of 2 upstreams if it has more than 1 upstream
             upstreams = list(G.predecessors(river))
-            downstream = sgdf.loc[sgdf[id_field] == river, ds_id_field].values[0]
+            downstream = list(G.successors(river))
+            downstream = downstream[0] if downstream else -1
             downstream_upstreams = [river, ] if downstream == -1 else list(G.predecessors(downstream))
             # if there is a confluence upstream and downstream then it cannot be fixed
             if len(upstreams) != 1 and len(downstream_upstreams) != 1:
@@ -462,7 +454,7 @@ def create_nexus_points(gdf: gpd.GeoDataFrame,
     for river_id in gdf[gdf['LengthGeodesicMeters'] <= 0.01][id_field].values:
         feat = gdf[gdf[id_field] == river_id]
         upstreams = set(gdf[gdf[ds_id_field] == river_id][id_field])
-        if not feat[ds_id_field].values != -1 and all([x != -1 for x in upstreams]):
+        if feat[ds_id_field].values == -1 and all([x != -1 for x in upstreams]):
             continue
 
         stream_row = gdf[gdf[id_field] == river_id]
@@ -484,11 +476,14 @@ def ancestors_safe(G: nx.DiGraph, node: int) -> set:
         return nx.ancestors(G, node)
     except nx.NetworkXError:
         return set()
+    
+def uscont_helper(values: np.ndarray, index):
+    return values[:-1].sum() if len(values) > 1 else values[0]
 
 def dissolve_branches(sgdf: gpd.GeoDataFrame,
                       head_to_dissolve: pd.DataFrame,
                       geometry_diss: bool = False,
-                      k_agg_func: types.FunctionType or str = 'last', ) -> pd.DataFrame:
+                      k_agg_func: Union[types.FunctionType, str] = 'last', ) -> pd.DataFrame:
     """
     Use pandas groupby to "dissolve" streams in the table by combining rows and handle metadata correctly
 
@@ -502,7 +497,7 @@ def dissolve_branches(sgdf: gpd.GeoDataFrame,
         a copy of the streams geodataframe with rows dissolved
     """
     logger.info('\tDissolving headwater streams in inputs master')
-    dissolve_map = {stream: streams[0] for streams in head_to_dissolve.values for stream in streams}
+    dissolve_map = {stream: streams[0] for streams in head_to_dissolve.values for stream in streams[1:]}
     sgdf['LINKNO'] = sgdf['LINKNO'].map(lambda x: dissolve_map.get(x, x))
 
     groups = sgdf.groupby('LINKNO')
@@ -513,11 +508,11 @@ def dissolve_branches(sgdf: gpd.GeoDataFrame,
                               'strmOrder': groups['strmOrder'].last(),
                               'Magnitude': groups['Magnitude'].last(),
                               'DSContArea': groups['DSContArea'].last(),
-                              'USContArea': groups['USContArea'].agg(lambda x: x.iloc[:-1].sum() if len(x) > 1 else x.iloc[0]),
+                              'USContArea': groups['USContArea'].agg(uscont_helper, engine='numba'),
                               'LengthGeodesicMeters': groups['LengthGeodesicMeters'].last(),
                               'TDXHydroRegion': groups['TDXHydroRegion'].last(),
                               'TopologicalOrder': groups['TopologicalOrder'].last(),
-                              'geometry': sgdf.dissolve(by='LINKNO').geometry} if geometry_diss else groups['geometry'].last()) # Default values are fastest
+                              'geometry': sgdf.dissolve(by='LINKNO').geometry if geometry_diss else groups['geometry'].last()}) # Default values are fastest
             .reset_index(drop=True)
             .sort_values('TopologicalOrder')
             )
@@ -566,7 +561,6 @@ def dissolve_short_streams(sgdf: gpd.GeoDataFrame, short_streams: pd.DataFrame) 
     sgdf = sgdf[~sgdf['LINKNO'].isin(rows_to_drop)]
     return gpd.GeoDataFrame(sgdf.reset_index(drop=True))
 
-
 def rapid_input_csvs(sdf: pd.DataFrame,
                      save_dir: str,
                      id_field: str = 'LINKNO',
@@ -591,34 +585,33 @@ def rapid_input_csvs(sdf: pd.DataFrame,
 
     """
     logger.info('Creating RAPID input csvs')
+    G = create_directed_graphs(sdf, id_field, ds_id_field=ds_id_field) # Searching the graph is faster than the dataframe
 
-    downstream_field = ds_id_field
     rapid_connect = []
-    max_count_upstream = 0
+    # max_count_upstream = 0
     for hydroid in sdf[id_field].values:
         # find the HydroID of the upstreams
-        list_upstream_ids = sdf.loc[sdf[downstream_field] == hydroid, id_field].values
+        list_upstream_ids = list(G.predecessors(hydroid))
         # count the total number of the upstreams
         count_upstream = len(list_upstream_ids)
-        if count_upstream > max_count_upstream:
-            max_count_upstream = count_upstream
-        next_down_id = sdf.loc[sdf[id_field] == hydroid, downstream_field].values[0]
+        # if count_upstream > max_count_upstream:
+        #     max_count_upstream = count_upstream
+        succesors = list(G.successors(hydroid))
+        next_down_id = succesors[0] if succesors else -1
 
         row_dict = {'HydroID': hydroid, 'NextDownID': next_down_id, 'CountUpstreamID': count_upstream}
         for i in range(count_upstream):
             row_dict[f'UpstreamID{i + 1}'] = list_upstream_ids[i]
         rapid_connect.append(row_dict)
 
-    # Fill in NaN values for any missing upstream IDs
-    for i in range(max_count_upstream):
-        col_name = f'UpstreamID{i + 1}'
-        for row in rapid_connect:
-            if col_name not in row:
-                row[col_name] = 0
-
     logger.info('\tWriting Rapid Connect CSV')
-    df = pd.DataFrame(rapid_connect)
-    df.to_csv(os.path.join(save_dir, 'rapid_connect.csv'), index=False, header=None)
+    (
+        pd.DataFrame(rapid_connect)
+        .fillna(0)
+        .astype(int)
+        .to_csv(os.path.join(save_dir, 'rapid_connect.csv'), index=False, header=None)
+        # .to_parquet(os.path.join(save_dir, 'rapid_connect.parquet'), index=False, header=None)
+    )
 
     logger.info('\tWriting RAPID Input CSVS')
     sdf.loc[:, ['lat', 'lon', 'z']] = 0
@@ -636,6 +629,8 @@ def river_route_inputs(sdf: pd.DataFrame,
     Create river route input files from a stream network dataframe
 
     Produces the following files:
+        - connectivity.parquet
+        - routing_parameters.parquet
 
     Args:
         sdf: stream network dataframe
@@ -644,6 +639,7 @@ def river_route_inputs(sdf: pd.DataFrame,
         ds_id_field: the field in the dataframe that contains the unique ID for the downstream stream
 
     Returns:
+        None
 
     """
     logger.info('\tWriting Connectivity Parquet')
@@ -768,7 +764,7 @@ def vpu_files_from_masters(vpu_df: pd.DataFrame,
         # Filter the nexus points to the VPU boundary
         vpu_bounds = vpu_boundary.total_bounds
         nexus_df = nexus_df.cx[vpu_bounds[0]:vpu_bounds[2], vpu_bounds[1]:vpu_bounds[3]]
-        nexus_df: dgpd.GeoDataFrame = dgpd.from_geopandas(nexus_df, npartitions=os.cpu_count()*2)
+        nexus_df: dgpd.GeoDataFrame = dgpd.from_geopandas(nexus_df, npartitions=estimate_num_partition(nexus_df))
         nexus_df = nexus_df[nexus_df.within(vpu_boundary.geometry.values[0])].compute()
 
         if nexus_df.empty:
@@ -805,7 +801,7 @@ def _k_agg_order_2(x: pd.Series) -> np.ndarray:
     return x.iloc[-1] + x.iloc[:-1].max() if len(x) > 1 else x.iloc[0]
 
 
-def _geom_diss(x: pd.Series or gpd.GeoSeries):
+def _geom_diss(x: Union[pd.Series, gpd.GeoSeries]):
     return gpd.GeoSeries(x).unary_union
 
 

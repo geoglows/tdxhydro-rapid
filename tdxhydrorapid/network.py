@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+from typing import Union
 
 import geopandas as gpd
 import dask_geopandas as dgpd
@@ -20,6 +21,7 @@ __all__ = [
     'correct_0_length_basins',
     'make_final_streams',
     'dissolve_catchments',
+    'estimate_num_partition',
 ]
 
 logger = logging.getLogger(__name__)
@@ -51,15 +53,15 @@ def find_headwater_branches_to_dissolve(sdf: gpd.GeoDataFrame,
     more_candidates = set()
     for stream_id in candidate_streams[id_field].values:
         predecessors = list(G.predecessors(stream_id))
-        if len(predecessors) < 2:
+        if len(predecessors) != 2: # Exclude lakes
             continue
         pred_orders = list(stream_orders_dict[x] for x in predecessors)
 
-        if len(pred_orders) == 2 and not len([x for x in pred_orders if x == (min_order_to_keep - 1)]) == 2:
+        if len(pred_orders) == 2 and len([x for x in pred_orders if x == (min_order_to_keep - 1)]) != 2:
             continue
 
         if (len(pred_orders) > 2) and \
-                (not max(pred_orders) == min_order_to_keep - 1) and \
+                (max(pred_orders) != min_order_to_keep - 1) and \
                 (len([x for x in pred_orders if x == (min_order_to_keep - 1)]) >= 2):
             continue
         more_candidates.add(stream_id)
@@ -75,67 +77,64 @@ def find_headwater_branches_to_dissolve(sdf: gpd.GeoDataFrame,
     upstream_df = upstream_df.reset_index()
     return upstream_df
 
-def find_branches_to_prune(sdf: gpd.GeoDataFrame or pd.DataFrame,
+def find_branches_to_prune(sdf: gpd.GeoDataFrame,
                            G: nx.DiGraph,
                            id_field: str = 'LINKNO',
                            ds_id_field: str = 'DSLINKNO', ) -> pd.DataFrame:
     # find all order 1 and 2+ branches
-    order1s = sdf.loc[sdf['strmOrder'] == 1]
+    order1s: gpd.GeoDataFrame = sdf.loc[sdf['strmOrder'] == 1]
+    order1s = order1s[[id_field, ds_id_field, 'strmOrder', 'geometry']]
     # select the order 1s whose downstream is 2+
     order1s = order1s.loc[order1s[ds_id_field].isin(sdf.loc[sdf['strmOrder'] >= 2, id_field].values)]
 
     sibling_pairs = [] 
     do_not_delete = set()
-    for index, row in order1s.iterrows():
-        if row[id_field] in do_not_delete:
+    for index, rivid, ds_rivid, strmOrder, geometry in order1s.itertuples():
+        if rivid in do_not_delete:
             continue
 
-        siblings = list(G.predecessors(row[ds_id_field]))
-        siblings = [s for s in siblings if s != row[id_field]]
+        siblings = [s for s in G.predecessors(ds_rivid) if s != rivid]
 
         if len(siblings) > 2:
             # This is an inlet to a lake. It should merge with the downstream stream
-            siblings = [row[ds_id_field], ]
+            siblings = [ds_rivid, ]
         # if there is only 1 sibling, we want to merge with that one
         # if there are 2+ siblings, we want need to figure out which one to merge with
         elif len(siblings) > 1:
             sibling_stream_orders = sdf[sdf[id_field].isin(siblings)]['strmOrder'].values
 
             # Case: 1 of the siblings has same order, one has higher order -> pick the highest stream order
-            if row['strmOrder'] in sibling_stream_orders and row['strmOrder'] < max(sibling_stream_orders):
+            if strmOrder in sibling_stream_orders and strmOrder < max(sibling_stream_orders):
                 siblings = [
-                    s for s in siblings if sdf.loc[sdf[id_field] == s, 'strmOrder'].values[0] > row['strmOrder']
+                    s for s in siblings if sdf.loc[sdf[id_field] == s, 'strmOrder'].values[0] > strmOrder
                 ]
 
             # otherwise, there are 2 higher order streams, and we should pick the nearest sibling
             else:
-                try:
-                    siblings = sdf[sdf[id_field].isin(siblings)]
-                    siblings['dist'] = (
-                        gpd
-                        .GeoSeries(siblings.geometry)
-                        .distance(row.geometry.centroid)
-                    )
-                    siblings = (
-                        siblings
-                        .sort_values('dist')
-                        .iloc[0]
-                        .loc[id_field]
-                    )
-                    siblings = [siblings, ]
-                except Exception as e:
-                    print(e)
-                    print(siblings)
-                    print(row)
+                siblings = sdf[sdf[id_field].isin(siblings)]
+                siblings['dist'] = siblings.geometry.distance(geometry.centroid)
+
+                # Filter siblings and find the one with the smallest distance
+                closest_sibling = (
+                    siblings[[id_field, 'dist']]
+                    .nsmallest(1, 'dist')
+                    .iloc[0][id_field]
+                )
+                siblings = [closest_sibling, ]
+
 
         if not siblings:
             # Let's merge with the downstream stream
-            siblings = [row[ds_id_field], ]
+            siblings = [ds_rivid, ]
+
+        if siblings[0] in do_not_delete:
+            continue
 
         # In the case where there is a 3 river confluence, there may be more than 1 order 1 stream that must be merged.
         # Instead of creating a dictionary to store these values (which can only have one unique key), we use a list of dictionaries (faster than appending to dataframe directly)
-        new_row = {'LINKNO': siblings[0], 'LINKTODROP': row[id_field]}
+        new_row = {'LINKNO': siblings[0], 'LINKTODROP': rivid}
         do_not_delete.add(siblings[0])
+        do_not_delete.add(rivid)
         sibling_pairs.append(new_row)
 
     return pd.DataFrame(sibling_pairs)
@@ -399,7 +398,7 @@ def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame,  id_field: str = '
 
     # dissolve the geometries based on shared value in the id field
     logging.info('\tDissolving catchments')
-    dgdf: dd.DataFrame = dd.from_pandas(gdf, npartitions=os.cpu_count()*2)
+    dgdf: dd.DataFrame = dd.from_pandas(gdf, npartitions=estimate_num_partition(gdf))
     dgdf: dgpd.GeoDataFrame = dgpd.from_dask_dataframe(dgdf.shuffle(on=id_field))
     gdf = dgdf.dissolve(by=id_field).compute().reset_index()
     if lake_outlets:
@@ -407,3 +406,8 @@ def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame,  id_field: str = '
     else:
         lake_gdf = gpd.GeoDataFrame()
     return gdf, lake_gdf
+
+def estimate_num_partition(df: Union[gpd.GeoDataFrame, pd.DataFrame]) -> int:
+    memory_usage_bytes = df.memory_usage(deep=True).sum()
+    memory_usage_mb = memory_usage_bytes / (1024 ** 2)
+    return max(os.cpu_count(), int(memory_usage_mb // 100))

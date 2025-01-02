@@ -12,6 +12,8 @@ import shapely.ops
 import xarray as xr
 import dask_geopandas as dgpd
 
+from .network import estimate_num_partition
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -109,9 +111,10 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
 
     logger.info('\tcalculating intersections and areas')
     tg_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(tg_gdf, npartitions=1)
-    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=80)
+    nparts = estimate_num_partition(basins_gdf)
+    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=nparts)
     intersections = overlay(basins_ddf, tg_ddf)
-    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=80).area.compute()
+    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=nparts).area.compute()
 
     intersections.loc[intersections[id_field].isna(), id_field] = 0
 
@@ -195,9 +198,10 @@ def make_weight_table_from_netcdf(lsm_sample: str,
         tg_gdf['lat_index'] = tg_gdf['lat'].apply(lambda y: np.argmin(np.abs(all_ys - y)))
 
     tg_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(tg_gdf, npartitions=1)
-    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=80)
+    nparts = estimate_num_partition(basins_gdf)
+    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=nparts)
     intersections = overlay(basins_ddf, tg_ddf)
-    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=80).area.compute()
+    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=nparts).area.compute()
 
     intersections.loc[intersections[id_field].isna(), id_field] = 0
 
@@ -306,7 +310,7 @@ def get_weight_table_name_from_grid(grid: Union[str, gpd.GeoDataFrame], warn=Fal
     dxs = gpq['lon'].round(12).drop_duplicates().sort_values().diff().dropna().unique()
     if len(dxs) > 1:
         if warn: logger.warning(f'Multiple dx values found in {grid}, using median')
-        dx = round(np.median(dys), 12)
+        dx = round(np.median(dxs), 12)
     else:
         dx = round(dxs[0], 12)
 

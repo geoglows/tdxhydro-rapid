@@ -6,7 +6,6 @@ import sys
 
 import geopandas as gpd
 from pyproj import Geod
-from shapely.geometry import Point
 
 gpkg_dir = 'test/gpkgs'
 gpq_dir = '/Volumes/EB406_T7_3/geoglows_v3/parquets'
@@ -51,6 +50,8 @@ if __name__ == '__main__':
         out_file_name = os.path.join(gpq_dir, os.path.basename(gpkg).replace('.gpkg', '.parquet'))
         if os.path.exists(out_file_name):
             continue
+
+        gdf = gpd.read_file(gpkg)
         
         if 'streamnet' in os.path.basename(gpkg):
             gdf['LINKNO'] = gdf['LINKNO'].astype(int) + (tdx_header_number * 10_000_000)

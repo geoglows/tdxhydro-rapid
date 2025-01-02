@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 
-import tqdm
 import geopandas as gpd
 from natsort import natsorted
 import pandas as pd
