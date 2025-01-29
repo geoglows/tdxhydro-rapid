@@ -6,6 +6,7 @@ import traceback
 import warnings
 
 import pandas as pd
+import geopandas as gpd
 
 import tdxhydrorapid as rp
 
@@ -29,6 +30,7 @@ length_field = 'LengthGeodesicMeters'
 
 MAKE_RAPID_INPUTS = False
 MAKE_WEIGHT_TABLES = True
+MAKE_NEXUS_FILES = True
 CACHE_GEOMETRY = True
 VELOCITY_FACTOR = None
 MIN_VELOCITY_FACTOR = 0.25
@@ -41,6 +43,8 @@ gis_iterable = zip(
     sorted(glob.glob(os.path.join(inputs_path, f'TDX_streamnet_{region_select}.parquet')), reverse=False),
     sorted(glob.glob(os.path.join(inputs_path, f'TDX_streamreach_basins_{region_select}.parquet')), reverse=False),
 )
+
+read_grids = [gpd.read_parquet(g) for g in sample_grids]
 
 for streams_gpq, basins_gpq in gis_iterable:
     region_num = os.path.basename(streams_gpq)
@@ -63,6 +67,11 @@ for streams_gpq, basins_gpq in gis_iterable:
     MERGE_SHORT_STREAMS = net_df.loc[net_df['region_number'] == region_num, 'merge_short_streams'].values[0]
     MIN_DRAINAGE_AREA_M2 = net_df.loc[net_df['region_number'] == region_num, 'min_area_km2'].values[0] * 1e6
     MIN_HEADWATER_STREAM_ORDER = net_df.loc[net_df['region_number'] == region_num, 'min_stream_order'].values[0]
+    DISSOLVE_LAKES = net_df.loc[net_df['region_number'] == region_num, 'dissolve_lakes'].values[0]
+    DROP_ISLANDS = net_df.loc[net_df['region_number'] == region_num, 'drop_islands'].values[0]
+    DROP_OCEAN_WATERSHEDS = net_df.loc[net_df['region_number'] == region_num, 'drop_ocean_watersheds'].values[0]
+    DROP_WITHIN_SEA = net_df.loc[net_df['region_number'] == region_num, 'drop_within_sea'].values[0]
+    DROP_LOW_FLOW = net_df.loc[net_df['region_number'] == region_num, 'drop_low_flow'].values[0]
 
     # cast configs as correct data types
     CORRECT_TAUDEM_ERRORS = bool(CORRECT_TAUDEM_ERRORS)
@@ -72,32 +81,47 @@ for streams_gpq, basins_gpq in gis_iterable:
     MERGE_SHORT_STREAMS = bool(MERGE_SHORT_STREAMS)
     MIN_DRAINAGE_AREA_M2 = float(MIN_DRAINAGE_AREA_M2)
     MIN_HEADWATER_STREAM_ORDER = int(MIN_HEADWATER_STREAM_ORDER)
+    DISSOLVE_LAKES = bool(DISSOLVE_LAKES)
+    DROP_ISLANDS = bool(DROP_ISLANDS)
+    DROP_OCEAN_WATERSHEDS = bool(DROP_OCEAN_WATERSHEDS)
+    DROP_WITHIN_SEA = bool(DROP_WITHIN_SEA)
+    DROP_LOW_FLOW = bool(DROP_LOW_FLOW)
 
     try:
         # make the master rapid input files
         if not os.path.exists(os.path.join(save_dir, 'rapid_inputs_master.parquet')) or \
-                (CACHE_GEOMETRY and not len(list(glob.glob(os.path.join(save_dir, '*.geoparquet'))))):
+                (CACHE_GEOMETRY and not len(list(glob.glob(os.path.join(save_dir, '*.geoparquet'))))) or \
+                not os.path.exists(os.path.join(save_dir, 'rapid_inputs_master.parquet')):
             rp.inputs.rapid_master_files(streams_gpq,
-                                         save_dir=save_dir, id_field=id_field, ds_id_field=ds_field,
-                                         length_field=length_field,
-                                         default_velocity_factor=VELOCITY_FACTOR,
-                                         drop_small_watersheds=DROP_SMALL_WATERSHEDS,
-                                         dissolve_headwaters=DISSOLVE_HEADWATERS,
-                                         prune_branches_from_main_stems=PRUNE_MAIN_STEMS,
-                                         merge_short_streams=MERGE_SHORT_STREAMS,
-                                         cache_geometry=CACHE_GEOMETRY,
-                                         min_drainage_area_m2=MIN_DRAINAGE_AREA_M2,
-                                         min_headwater_stream_order=MIN_HEADWATER_STREAM_ORDER,
-                                         min_velocity_factor=MIN_VELOCITY_FACTOR,
-                                         min_k_value=MIN_K_VALUE,
-                                         lake_min_k=LAKE_K_VALUE, )
+                                        save_dir=save_dir, id_field=id_field, ds_id_field=ds_field,
+                                        length_field=length_field,
+                                        default_velocity_factor=VELOCITY_FACTOR,
+                                        drop_small_watersheds=DROP_SMALL_WATERSHEDS,
+                                        dissolve_headwaters=DISSOLVE_HEADWATERS,
+                                        prune_branches_from_main_stems=PRUNE_MAIN_STEMS,
+                                        merge_short_streams=MERGE_SHORT_STREAMS,
+                                        cache_geometry=CACHE_GEOMETRY,
+                                        dissolve_lakes=DISSOLVE_LAKES,
+                                        drop_islands=DROP_ISLANDS,
+                                        drop_ocean_watersheds=DROP_OCEAN_WATERSHEDS,
+                                        drop_within_sea=DROP_WITHIN_SEA,
+                                        drop_low_flow=DROP_LOW_FLOW,
+                                        make_nexus_points=MAKE_NEXUS_FILES,
+                                        min_drainage_area_m2=MIN_DRAINAGE_AREA_M2,
+                                        min_headwater_stream_order=MIN_HEADWATER_STREAM_ORDER,
+                                        min_velocity_factor=MIN_VELOCITY_FACTOR,
+                                        min_k_value=MIN_K_VALUE,
+                                        lake_min_k=LAKE_K_VALUE, )
 
+        # make nexus points
+        if MAKE_NEXUS_FILES and not os.path.exists(os.path.join(save_dir, 'nexus_points.gpkg')):
+            rp.inputs.create_nexus_points(save_dir, MIN_HEADWATER_STREAM_ORDER, id_field)
         # make the rapid input files
         if MAKE_RAPID_INPUTS and not all([os.path.exists(os.path.join(save_dir, f)) for f in rp.RAPID_FILES]):
             rp.inputs.rapid_input_csvs(pd.read_parquet(os.path.join(save_dir, 'rapid_inputs_master.parquet')),
-                                       save_dir,
-                                       id_field=id_field,
-                                       ds_id_field=ds_field, )
+                                    save_dir,
+                                    id_field=id_field,
+                                    ds_id_field=ds_field, )
 
         # break for weight tables
         if not MAKE_WEIGHT_TABLES:
@@ -105,10 +129,8 @@ for streams_gpq, basins_gpq in gis_iterable:
 
         # make the master weight tables
         basins_gdf = None
-        expect_tables = [f'weight_{os.path.basename(f)}' for f in sample_grids]
-        expect_tables = [f.replace('_thiessen_grid.parquet', '_full.csv') for f in expect_tables]
-        expect_tables = [os.path.join(save_dir, f) for f in expect_tables]
-        if not all([os.path.exists(os.path.join(save_dir, f)) for f in expect_tables]):
+        expect_tables = {os.path.join(save_dir, f.replace('.parquet', '_full.parquet')) for f in rp.weights.get_expected_weight_tables(read_grids)}
+        if not all([os.path.exists(f) for f in expect_tables]):
             logging.info('Reading basins')
             basins_gdf = rp.network.correct_0_length_basins(basins_gpq,
                                                             save_dir=save_dir,
@@ -124,8 +146,8 @@ for streams_gpq, basins_gpq in gis_iterable:
                                                                 basins_gdf=basins_gdf,
                                                                 id_field=id_field)
 
-        for weight_table in glob.glob(os.path.join(save_dir, 'weight*full.csv')):
-            out_path = weight_table.replace('_full.csv', '.csv')
+        for weight_table in expect_tables:
+            out_path = weight_table.replace('_full.parquet', '.parquet')
 
             if os.path.exists(out_path):
                 logging.info(f'Weight table already exists: {os.path.basename(out_path)}')

@@ -1,6 +1,8 @@
 import logging
 import os
 import warnings
+import json
+from typing import Generator, Union
 
 import geopandas as gpd
 import numpy as np
@@ -8,6 +10,9 @@ import pandas as pd
 import shapely.geometry
 import shapely.ops
 import xarray as xr
+import dask_geopandas as dgpd
+
+from .network import estimate_num_partition
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +21,12 @@ __all__ = [
     'make_weight_table_from_thiessen_grid',
     'make_weight_table_from_netcdf',
     'apply_weight_table_simplifications',
+    'get_expected_weight_tables'
 ]
 
 
-def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, out_dir: str, ) -> None:
+def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, 
+                                          out_dir: str, ) -> None:
     new_file_name = os.path.basename(lsm_sample).replace('.nc', '_thiessen_grid.parquet')
     new_file_name = os.path.join(out_dir, new_file_name)
     if os.path.exists(new_file_name):
@@ -64,26 +71,40 @@ def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, out_dir: str, ) -> No
         tg_gdf['lon_index'] = tg_gdf['lon'].apply(lambda x: np.argmin(np.abs(all_xs - x)))
         tg_gdf['lat_index'] = tg_gdf['lat'].apply(lambda y: np.argmin(np.abs(all_ys - y)))
 
+    # Remove invalid geometries
+    tg_gdf = tg_gdf[tg_gdf['lon'].between(-180, 180) & tg_gdf['lat'].between(-90, 90)]
+    tg_gdf = tg_gdf.reset_index(drop=True)
+
     # save the thiessen grid to disc
     logging.info('\tSaving Thiessen grid to disc')
     tg_gdf.to_parquet(new_file_name)
     return
 
+def overlay(left: dgpd.GeoDataFrame, right: dgpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Performs a spatial intersection overlay of two GeoDataFrames using Dask.
+    Reproject geometries to a Cylindrical Equal Area projection.
+    """
+    return gpd.GeoDataFrame(
+        left.sjoin(right.assign(right_geometry=right.geometry))
+        .assign(geometry=lambda x: x.geometry.intersection(x.right_geometry).to_crs({'proj':'cea'}))
+        .drop(columns="right_geometry")
+        .compute()).sort_index() # Sort index is needed (used when calcualting area_sqm)
 
 def make_weight_table_from_thiessen_grid(tg_parquet: str,
                                          out_dir: str,
                                          basins_gdf: gpd.GeoDataFrame,
                                          id_field: str = 'LINKNO') -> None:
-    weight_file_name = os.path.basename(tg_parquet).replace('_thiessen_grid.parquet', '_full.csv')
-    out_name = os.path.join(out_dir, f'weight_{weight_file_name}')
+    # load the thiessen grid
+    logger.info('\tloading thiessen grid')
+    tg_gdf = gpd.read_parquet(tg_parquet)
+
+    weight_file_name = get_weight_table_name_from_grid(tg_gdf).replace('.parquet', '_full.parquet')
+    out_name = os.path.join(out_dir, weight_file_name)
     if os.path.exists(os.path.join(out_dir, out_name)):
         logger.info(f'Weight table already exists: {os.path.basename(out_name)}')
         return
     logger.info(f'Creating weight table: {os.path.basename(out_name)}')
-
-    # load the thiessen grid
-    logger.info('\tloading thiessen grid')
-    tg_gdf = gpd.read_parquet(tg_parquet)
 
     # filter the thiessen grid to only include points within the basins bounding box
     logger.info('\tfiltering thiessen grid by bounding box')
@@ -91,8 +112,11 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
     tg_gdf = tg_gdf.cx[basins_bbox[0]:basins_bbox[2], basins_bbox[1]:basins_bbox[3]]
 
     logger.info('\tcalculating intersections and areas')
-    intersections = gpd.overlay(tg_gdf, basins_gdf, how='intersection')
-    intersections['area_sqm'] = intersections.geometry.to_crs({'proj': 'cea'}).area
+    tg_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(tg_gdf, npartitions=1)
+    nparts = estimate_num_partition(basins_gdf)
+    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=nparts)
+    intersections = overlay(basins_ddf, tg_ddf)
+    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=nparts).area.compute()
 
     intersections.loc[intersections[id_field].isna(), id_field] = 0
 
@@ -100,7 +124,7 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
     (
         intersections[[id_field, 'area_sqm', 'lon_index', 'lat_index', 'lon', 'lat']]
         .sort_values([id_field, 'area_sqm'])
-        .to_csv(out_name, index=False)
+        .to_parquet(out_name)
     )
 
 
@@ -108,7 +132,7 @@ def make_weight_table_from_netcdf(lsm_sample: str,
                                   out_dir: str,
                                   basins_gdf: gpd.GeoDataFrame,
                                   id_field: str = 'LINKNO') -> None:
-    out_name = os.path.join(out_dir, 'weight_' + os.path.basename(os.path.splitext(lsm_sample)[0]) + '_full.csv')
+    out_name = os.path.join(out_dir, 'weight_' + os.path.basename(os.path.splitext(lsm_sample)[0]) + '_full.parquet')
     if os.path.exists(os.path.join(out_dir, out_name)):
         logger.info(f'Weight table already exists: {os.path.basename(out_name)}')
         return
@@ -175,8 +199,11 @@ def make_weight_table_from_netcdf(lsm_sample: str,
         tg_gdf['lon_index'] = tg_gdf['lon'].apply(lambda x: np.argmin(np.abs(all_xs - x)))
         tg_gdf['lat_index'] = tg_gdf['lat'].apply(lambda y: np.argmin(np.abs(all_ys - y)))
 
-    intersections = gpd.overlay(tg_gdf, basins_gdf, how='intersection')
-    intersections['area_sqm'] = intersections.geometry.to_crs({'proj': 'cea'}).area
+    tg_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(tg_gdf, npartitions=1)
+    nparts = estimate_num_partition(basins_gdf)
+    basins_ddf: dgpd.GeoDataFrame = dgpd.from_geopandas(basins_gdf, npartitions=nparts)
+    intersections = overlay(basins_ddf, tg_ddf)
+    intersections['area_sqm'] = dgpd.from_geopandas(intersections, npartitions=nparts).area.compute()
 
     intersections.loc[intersections[id_field].isna(), id_field] = 0
 
@@ -191,32 +218,75 @@ def make_weight_table_from_netcdf(lsm_sample: str,
     )
     return
 
-
 def apply_weight_table_simplifications(save_dir: str,
                                        weight_table_in_path: str,
                                        weight_table_out_path: str,
                                        id_field: str = 'LINKNO') -> None:
     logging.info(f'Processing {weight_table_in_path}')
-    wt = pd.read_csv(weight_table_in_path)
+    wt = pd.read_parquet(weight_table_in_path)
 
     headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
     if os.path.exists(headwater_dissolve_path):
         o2_to_dissolve = pd.read_csv(headwater_dissolve_path).fillna(-1).astype(int)
-        for streams_to_merge in o2_to_dissolve.values:
-            wt.loc[wt[id_field].isin(streams_to_merge), id_field] = streams_to_merge[0]
+        merge_dict = {stream: streams_to_merge[0] for streams_to_merge in o2_to_dissolve.values for stream in streams_to_merge}
+        wt[id_field] = wt[id_field].map(merge_dict).fillna(wt[id_field]).astype(int)
 
     streams_to_prune_path = os.path.join(save_dir, 'mod_prune_streams.csv')
     if os.path.exists(streams_to_prune_path):
-        ids_to_prune = pd.read_csv(streams_to_prune_path).astype(int).set_index('LINKTODROP')
-        wt[id_field] = wt[id_field].replace(ids_to_prune['LINKNO'])
+        ids_to_prune = pd.read_csv(streams_to_prune_path).astype(int).set_index('LINKTODROP')['LINKNO'].to_dict()
+        wt[id_field] = wt[id_field].map(ids_to_prune).fillna(wt[id_field]).astype(int)
 
     drop_streams_path = os.path.join(save_dir, 'mod_drop_small_trees.csv')
     if os.path.exists(drop_streams_path):
         ids_to_drop = pd.read_csv(drop_streams_path).astype(int)
         wt = wt[~wt[id_field].isin(ids_to_drop.values.flatten())]
 
-    # group by matching values in columns except for area_sqm and sum the areas in grouped rows
     wt = wt.groupby(wt.columns.drop('area_sqm').tolist()).sum().reset_index()
+
+    lake_streams_path = os.path.join(save_dir, 'mod_dissolve_lakes.json')
+    if os.path.exists(lake_streams_path):
+        lake_streams_df = pd.read_json(lake_streams_path, orient='index', convert_axes=False, convert_dates=False)
+        streams_to_delete = set()
+        for outlet, _, lake_streams in lake_streams_df.itertuples():
+            outlet = int(outlet)
+            if outlet in wt[id_field].values:
+                wt.loc[wt[id_field].isin(lake_streams), id_field] = outlet
+            else:
+                streams_to_delete.update(lake_streams)
+
+        wt = wt[~wt[id_field].isin(streams_to_delete)]
+        wt = wt.groupby(wt.columns.drop('area_sqm').tolist()).sum().reset_index()
+
+    low_flow_streams_path = os.path.join(save_dir, 'mod_drop_low_flow.json')
+    if os.path.exists(low_flow_streams_path):
+        with open(low_flow_streams_path, 'r') as f:
+            low_flow_streams_dict: dict = json.load(f)
+
+        streams_to_delete = set()
+        for outlet, low_flow_streams in low_flow_streams_dict.items():
+            outlet = int(outlet)
+            if outlet in wt[id_field].values:
+                wt.loc[wt[id_field].isin(low_flow_streams), id_field] = outlet
+            else:
+                streams_to_delete.update(low_flow_streams)              
+
+        wt = wt[~wt[id_field].isin(streams_to_delete)]
+        wt = wt.groupby(wt.columns.drop('area_sqm').tolist()).sum().reset_index()
+    
+    island_streams_path = os.path.join(save_dir, 'mod_dissolve_islands.json')
+    if os.path.exists(island_streams_path):
+        with open(island_streams_path, 'r') as f:
+            island_streams_dict: dict = json.load(f)
+
+        streams_to_delete = set()
+        for outlet, island_streams in island_streams_dict.items():
+            outlet = int(outlet)
+            if outlet == -1 or outlet not in wt[id_field].values:
+                streams_to_delete.update(island_streams)
+            else:
+                wt.loc[wt[id_field].isin(island_streams), id_field] = outlet
+
+        wt = wt[~wt[id_field].isin(streams_to_delete)]
 
     # merge small streams into larger streams
     merge_streams_path = os.path.join(save_dir, 'mod_merge_short_streams.csv')
@@ -224,11 +294,41 @@ def apply_weight_table_simplifications(save_dir: str,
         merge_streams = pd.read_csv(merge_streams_path).astype(int)
         for merge_stream in merge_streams.values:
             # check that both ID's exist before editing - some may have been fixed in previous iterations
-            if wt[wt[id_field] == merge_stream[0]].empty or wt[wt[id_field] == merge_stream[1]].empty:
+            if merge_stream[0] not in wt[id_field].values or merge_stream[1] not in wt[id_field].values:
                 continue
             wt[id_field] = wt[id_field].replace(merge_stream[1], merge_stream[0])
 
+    # group by matching values in columns except for area_sqm, and sum the areas in grouped rows
     wt = wt.groupby(wt.columns.drop('area_sqm').tolist()).sum().reset_index()
     wt = wt.sort_values([id_field, 'area_sqm'], ascending=[True, False])
-    wt.to_csv(weight_table_out_path, index=False)
+    wt.to_parquet(weight_table_out_path, index=False)
     return
+
+def get_weight_table_name_from_grid(grid: Union[str, gpd.GeoDataFrame], warn=False) -> str:
+    if isinstance(grid, str):
+        gpq = gpd.read_parquet(grid)
+    else:
+        gpq = grid
+    dxs = gpq['lon'].round(12).drop_duplicates().sort_values().diff().dropna().unique()
+    if len(dxs) > 1:
+        if warn: logger.warning(f'Multiple dx values found in {grid}, using median')
+        dx = round(np.median(dxs), 12)
+    else:
+        dx = round(dxs[0], 12)
+
+    dys = gpq['lat'].round(12).drop_duplicates().sort_values().diff().dropna().unique()
+    if len(dys) > 1:
+        if warn: logger.warning(f'Multiple dy values found in {grid}, using median')
+        dy = round(np.median(dys), 12)
+    else:
+        dy = round(dys[0], 12)
+    
+    xinit = gpq['lon'].round(12).min()
+    yinit = gpq['lat'].round(12).min()
+    
+    return f"weight_xinit={xinit}_yinit={yinit}_dx={dx}_dy={dy}.parquet"
+
+def get_expected_weight_tables(sample_grids: list[str], warn=False) -> Generator[str, None, None]:
+    for grid in sample_grids:
+        yield get_weight_table_name_from_grid(grid, warn)
+

@@ -1,10 +1,5 @@
-import geopandas as gpd
-import pandas as pd
-import glob
-import os
-import natsort
+import dask_geopandas as dgpd
 
-
-gpq = natsort.natsorted(glob.glob('/Volumes/T9Hales4TB/geoglows2/tdxhydro-inputs/*/*geoparquet'))
-gdf = pd.concat([gpd.read_parquet(g).simplify() for g in gpq])
-print(gpq)
+gdf = dgpd.read_parquet('/Users/ricky/tdxhydro-postprocessing/test/rapid_inputs/*/*geoparquet', filesystem='arrow', columns=['LINKNO', 'geometry'])
+gdf['geometry'] = gdf['geometry'].simplify(0.001, preserve_topology=False)
+gdf.compute().to_file('test_global_streams_simplified_dask.gpkg', driver='GPKG')
