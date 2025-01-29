@@ -30,6 +30,7 @@ length_field = 'LengthGeodesicMeters'
 
 MAKE_RAPID_INPUTS = False
 MAKE_WEIGHT_TABLES = True
+MAKE_NEXUS_FILES = True
 CACHE_GEOMETRY = True
 VELOCITY_FACTOR = None
 MIN_VELOCITY_FACTOR = 0.25
@@ -105,12 +106,16 @@ for streams_gpq, basins_gpq in gis_iterable:
                                         drop_ocean_watersheds=DROP_OCEAN_WATERSHEDS,
                                         drop_within_sea=DROP_WITHIN_SEA,
                                         drop_low_flow=DROP_LOW_FLOW,
+                                        make_nexus_points=MAKE_NEXUS_FILES,
                                         min_drainage_area_m2=MIN_DRAINAGE_AREA_M2,
                                         min_headwater_stream_order=MIN_HEADWATER_STREAM_ORDER,
                                         min_velocity_factor=MIN_VELOCITY_FACTOR,
                                         min_k_value=MIN_K_VALUE,
                                         lake_min_k=LAKE_K_VALUE, )
 
+        # make nexus points
+        if MAKE_NEXUS_FILES and not os.path.exists(os.path.join(save_dir, 'nexus_points.gpkg')):
+            rp.inputs.create_nexus_points(save_dir, MIN_HEADWATER_STREAM_ORDER, id_field)
         # make the rapid input files
         if MAKE_RAPID_INPUTS and not all([os.path.exists(os.path.join(save_dir, f)) for f in rp.RAPID_FILES]):
             rp.inputs.rapid_input_csvs(pd.read_parquet(os.path.join(save_dir, 'rapid_inputs_master.parquet')),
@@ -124,7 +129,7 @@ for streams_gpq, basins_gpq in gis_iterable:
 
         # make the master weight tables
         basins_gdf = None
-        expect_tables = {os.path.join(save_dir, f.replace('.csv', '_full.csv')) for f in rp.weights.get_expected_weight_tables(read_grids, True)}
+        expect_tables = {os.path.join(save_dir, f.replace('.parquet', '_full.parquet')) for f in rp.weights.get_expected_weight_tables(read_grids)}
         if not all([os.path.exists(f) for f in expect_tables]):
             logging.info('Reading basins')
             basins_gdf = rp.network.correct_0_length_basins(basins_gpq,
@@ -142,7 +147,7 @@ for streams_gpq, basins_gpq in gis_iterable:
                                                                 id_field=id_field)
 
         for weight_table in expect_tables:
-            out_path = weight_table.replace('__full.csv', '.csv')
+            out_path = weight_table.replace('_full.parquet', '.parquet')
 
             if os.path.exists(out_path):
                 logging.info(f'Weight table already exists: {os.path.basename(out_path)}')

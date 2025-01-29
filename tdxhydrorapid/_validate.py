@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 def tdxhydro_corrections_consistent(input_dir: str) -> bool:
     n_streams = pd.read_parquet(os.path.join(input_dir, 'rapid_inputs_master.parquet')).shape[0]
-    weights = sorted(glob.glob(os.path.join(input_dir, 'weight_*.csv')))
+    weights = sorted(glob.glob(os.path.join(input_dir, 'weight_*.parquet')))
     weights = [x for x in weights if 'full' not in x]
-    n_weights = [pd.read_csv(x).iloc[:, 0].unique().shape[0] for x in weights]
+    n_weights = [pd.read_parquet(x).iloc[:, 0].unique().shape[0] for x in weights]
     logger.info(f'Validating {os.path.basename(input_dir)}')
     logger.info(f'\tNumber of streams: {n_streams}')
     for w, n in zip(weights, n_weights):
@@ -48,8 +48,8 @@ def check_outputs_are_valid(input_dir: str, use_rapid: bool = False) -> bool:
         n_connectivity = pd.read_parquet(os.path.join(input_dir, 'connectivity.parquet')).shape[0]
         n_routing_params = pd.read_parquet(os.path.join(input_dir, 'routing_parameters.parquet')).shape[0]
     n_weights = []
-    for f in sorted(glob.glob(os.path.join(input_dir, 'weight_*.csv'))):
-        df = pd.read_csv(f)
+    for f in sorted(glob.glob(os.path.join(input_dir, 'weight_*.parquet'))):
+        df = pd.read_parquet(f)
         n_weights.append((os.path.basename(f), df.iloc[:, 0].unique().shape[0]))
 
     logger.info('Checking for consistent numbers of basins in generated files')
@@ -84,6 +84,6 @@ def check_outputs_are_valid(input_dir: str, use_rapid: bool = False) -> bool:
 
 
 def has_slimmed_weight_tables(save_dir: str) -> bool:
-    full_wts = sorted(glob.glob(os.path.join(save_dir, 'weight_*_full.csv')))
-    has_slim_tables = [os.path.exists(f.replace('_full.csv', '.csv')) for f in full_wts]
+    full_wts = sorted(glob.glob(os.path.join(save_dir, 'weight_*_full.parquet')))
+    has_slim_tables = [os.path.exists(f.replace('_full.parquet', '.parquet')) for f in full_wts]
     return all(has_slim_tables)

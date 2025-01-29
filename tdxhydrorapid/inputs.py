@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import types
-import threading
 from typing import Union
 
 import geopandas as gpd
@@ -12,7 +11,13 @@ import dask_geopandas as dgpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point
+from shapely.geometry import Point, MultiLineString
+
+try:
+    import numba
+    ENGINE = 'numba'
+except ImportError:
+    ENGINE = None
 
 from .network import correct_0_length_streams
 from .network import create_directed_graphs
@@ -34,6 +39,8 @@ __all__ = [
     'concat_tdxregions',
     'vpu_files_from_masters',
     'create_directed_graphs'
+    'create_nexus_points',
+    'nexus_file_from_masters',
 ]
 
 def rapid_master_files(streams_gpq: str,
@@ -103,11 +110,6 @@ def rapid_master_files(streams_gpq: str,
     logging.info(f'\tNumber of streams: {sgdf.shape[0]}')
 
     if not sgdf[sgdf[length_field] <= 0.01].empty:
-        logger.info('\tSaving nexus points')
-        nexus_file = os.path.join(save_dir, 'nexus_points.gpkg')
-        if not os.path.exists(nexus_file):
-            create_nexus_points(sgdf, nexus_file, id_field, ds_id_field)
-
         logger.info('\tRemoving 0 length segments')
         zero_length_fixes_df = identify_0_length(sgdf, id_field, ds_id_field, length_field)
         zero_length_fixes_df.to_csv(os.path.join(save_dir, 'mod_zero_length_streams.csv'), index=False)
@@ -138,6 +140,7 @@ def rapid_master_files(streams_gpq: str,
         .astype(sgdf.dtypes.to_dict())
     )
 
+    dissolve_lake_dict = {}
     if dissolve_lakes:
         logger.info('\tDissolving lakes')
         lake_csv = os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv')
@@ -446,27 +449,62 @@ def rapid_master_files(streams_gpq: str,
     sgdf.drop(columns=['geometry', ]).to_parquet(os.path.join(save_dir, "rapid_inputs_master.parquet"))
     return
 
-def create_nexus_points(gdf: gpd.GeoDataFrame, 
-                        nexus_file: str, 
-                        id_field: str = 'LINKNO', 
-                        ds_id_field: str = 'DSLINKNO') -> None:
+def create_nexus_points(save_dir: str,
+                        min_strm_order: int,
+                        id_field: str = 'LINKNO', ) -> None:
+    geometry_files = glob.glob(os.path.join(save_dir, '*_altered_network.geoparquet'))
+    if not geometry_files:
+        return
+    
+    logger.info('\tCreating Nexus Points')
+    df = pd.read_parquet(os.path.join(save_dir, 'rapid_inputs_master.parquet'))
+    lake_table = pd.read_csv(os.path.join(os.path.dirname(__file__), 'network_data', 'lake_table.csv'))
+    gdf = gpd.read_parquet(geometry_files[0])
+    gdf = gdf.merge(df[[id_field, 'DSLINKNO', 'strmOrder']], on=id_field, how='left')
+    G = create_directed_graphs(gdf, id_field)
+
+    # Search for lake .json
+    lake_json = os.path.join(save_dir, 'mod_dissolve_lakes.json')
+    if os.path.exists(lake_json):
+        with open(lake_json, 'r') as f:
+            dissolve_lake_dict = json.load(f)
+        ids_to_ignore = set(dissolve_lake_dict.keys())
+    else:
+        ids_to_ignore = set()
+    ids_to_ignore.update(set(lake_table['outlet']))
+
     nexus_list = []
-    for river_id in gdf[gdf['LengthGeodesicMeters'] <= 0.01][id_field].values:
-        feat = gdf[gdf[id_field] == river_id]
-        upstreams = set(gdf[gdf[ds_id_field] == river_id][id_field])
-        if feat[ds_id_field].values == -1 and all([x != -1 for x in upstreams]):
+
+    # We will ignore headwaters
+    ids_to_consider = set(gdf[gdf['strmOrder'] > min_strm_order][id_field]) - ids_to_ignore
+    geom_dict = gdf.set_index(id_field)['geometry'].to_dict()
+    strm_order_dict = gdf.set_index(id_field)['strmOrder'].to_dict()
+    for node in ids_to_consider:
+        # Get upstreams
+        upstreams = list(G.predecessors(node))
+
+        # Only use streams with 3+ connections
+        if len(upstreams) < 2:
             continue
 
-        stream_row = gdf[gdf[id_field] == river_id]
-        point = Point(stream_row['geometry'].values[0].coords[0])
-        downstream = gdf[gdf[id_field] == stream_row[ds_id_field].values[0]]
-        ds_strahler_order = downstream['strmOrder'].values[0]
-        upstreams = ",".join(map(str, upstreams))
+        # Don't use lake streams
+        if len(upstreams) > 2:
+            continue
         
-        nexus_list.append((river_id, point.y, point.x, downstream[id_field].values[0], ds_strahler_order, upstreams, point))
+        # Get first point of the downstream stream - note that if you change the order in which geometries are dissolved (merging small k streams), this will need to be updated
+        downstream_geom = geom_dict[node]
+        if isinstance(downstream_geom, MultiLineString):
+            downstream_geom = downstream_geom.geoms[-1] # Last index is most upstream
+        downstream_coords = downstream_geom.coords[-1]
+        lat, lon = downstream_coords[1], downstream_coords[0]
+
+        # Get strahler order
+        strahler_order = strm_order_dict[node]
+        nexus_list.append([lat, lon, node, strahler_order, ",".join(map(str, upstreams)), Point(lon, lat)])
 
     if nexus_list:
-        gpd.GeoDataFrame(nexus_list, columns=['LINKNO', 'Lat', 'Lon', 'DSLINKNO', 'DSStrahlerOrder', 'USLINKNOs', 'geometry'], crs=gdf.crs).to_file(nexus_file, index=False)
+        nexus_file = os.path.join(save_dir, 'nexus_points.gpkg')
+        gpd.GeoDataFrame(nexus_list, columns=['Lat', 'Lon', 'DSLINKNO', 'DSStrahlerOrder', 'USLINKNOs', 'geometry'], crs=gdf.crs).to_file(nexus_file, index=False)
     else:
         logger.info('No Nexus Points Found')
 
@@ -477,8 +515,12 @@ def ancestors_safe(G: nx.DiGraph, node: int) -> set:
     except nx.NetworkXError:
         return set()
     
-def uscont_helper(values: np.ndarray, index):
-    return values[:-1].sum() if len(values) > 1 else values[0]
+if ENGINE == 'numba':
+    def uscont_helper(values: np.ndarray, index):
+        return values[:-1].sum() if len(values) > 1 else values[0]
+else:
+    def uscont_helper(values: pd.Series):
+        return values.iloc[:-1].sum() if len(values) > 1 else values.iloc[0]
 
 def dissolve_branches(sgdf: gpd.GeoDataFrame,
                       head_to_dissolve: pd.DataFrame,
@@ -508,7 +550,7 @@ def dissolve_branches(sgdf: gpd.GeoDataFrame,
                               'strmOrder': groups['strmOrder'].last(),
                               'Magnitude': groups['Magnitude'].last(),
                               'DSContArea': groups['DSContArea'].last(),
-                              'USContArea': groups['USContArea'].agg(uscont_helper, engine='numba'),
+                              'USContArea': groups['USContArea'].agg(uscont_helper, engine=ENGINE),
                               'LengthGeodesicMeters': groups['LengthGeodesicMeters'].last(),
                               'TDXHydroRegion': groups['TDXHydroRegion'].last(),
                               'TopologicalOrder': groups['TopologicalOrder'].last(),
@@ -588,14 +630,12 @@ def rapid_input_csvs(sdf: pd.DataFrame,
     G = create_directed_graphs(sdf, id_field, ds_id_field=ds_id_field) # Searching the graph is faster than the dataframe
 
     rapid_connect = []
-    # max_count_upstream = 0
     for hydroid in sdf[id_field].values:
         # find the HydroID of the upstreams
         list_upstream_ids = list(G.predecessors(hydroid))
+
         # count the total number of the upstreams
         count_upstream = len(list_upstream_ids)
-        # if count_upstream > max_count_upstream:
-        #     max_count_upstream = count_upstream
         succesors = list(G.successors(hydroid))
         next_down_id = succesors[0] if succesors else -1
 
@@ -610,7 +650,6 @@ def rapid_input_csvs(sdf: pd.DataFrame,
         .fillna(0)
         .astype(int)
         .to_csv(os.path.join(save_dir, 'rapid_connect.csv'), index=False, header=None)
-        # .to_parquet(os.path.join(save_dir, 'rapid_connect.parquet'), index=False, header=None)
     )
 
     logger.info('\tWriting RAPID Input CSVS')
@@ -720,8 +759,7 @@ def vpu_files_from_masters(vpu_df: pd.DataFrame,
                            tdxinputs_directory: str,
                            make_gpkg: bool,
                            gpkg_dir: str, 
-                           use_rapid: bool = False,
-                           vpu_boundaries: Union[gpd.GeoDataFrame, None] = None) -> None:
+                           use_rapid: bool = False, ) -> None:
     tdx_region = vpu_df['TDXHydroRegion'].values[0]
     vpu = vpu_df['VPUCode'].values[0]
 
@@ -732,57 +770,55 @@ def vpu_files_from_masters(vpu_df: pd.DataFrame,
         river_route_inputs(vpu_df, vpu_dir)
 
     # subset the weight tables
-    logging.info('Subsetting weight tables')
-    weight_tables = glob.glob(os.path.join(tdxinputs_directory, tdx_region, f'weight*.csv'))
-    weight_tables = [x for x in weight_tables if '_full.csv' not in x]
+    logging.info('\tSubsetting weight tables')
+    weight_tables = glob.glob(os.path.join(tdxinputs_directory, tdx_region, f'weight*.parquet'))
+    weight_tables = [x for x in weight_tables if '_full.parquet' not in x]
     for weight_table in weight_tables:
-        a = pd.read_csv(weight_table)
+        a = pd.read_parquet(weight_table)
         a = a[a.iloc[:, 0].astype(int).isin(vpu_df['LINKNO'].values)]
-        a.to_csv(os.path.join(vpu_dir, os.path.basename(weight_table)), index=False)
+        a.to_parquet(os.path.join(vpu_dir, os.path.basename(weight_table)), index=False)
 
     if not make_gpkg:
         return
-    logging.info('Making gpkg')
+    logging.info('\tMaking gpkg')
     altered_network = os.path.join(tdxinputs_directory, tdx_region, f'{tdx_region}_altered_network.geoparquet')
     vpu_network = os.path.join(gpkg_dir, f'streams_{vpu}.gpkg')
     if os.path.exists(altered_network):
-        gdf = (
-            gpd.read_parquet(altered_network)
-            .merge(vpu_df, on='LINKNO', how='inner')
-        )
-        # Saving (and updating CRS of) the GPKG in another thread saves lots of time
-        save_thread = threading.Thread(target=make_vpu_gpkg, args=(gdf, vpu_network))
-        save_thread.start()
-
-    nexus_region_file = os.path.join(tdxinputs_directory, tdx_region, 'nexus_points.gpkg')
-    if os.path.exists(nexus_region_file) and vpu_boundaries is not None:
-        # Create an enevlope of the current VPU
-        vpu_boundary = vpu_boundaries[vpu_boundaries['VPU'] == str(vpu)]
-        nexus_file = os.path.join(gpkg_dir, f'nexus_{vpu}.gpkg')
-        nexus_df = gpd.read_file(nexus_region_file)
-
-        # Filter the nexus points to the VPU boundary
-        vpu_bounds = vpu_boundary.total_bounds
-        nexus_df = nexus_df.cx[vpu_bounds[0]:vpu_bounds[2], vpu_bounds[1]:vpu_bounds[3]]
-        nexus_df: dgpd.GeoDataFrame = dgpd.from_geopandas(nexus_df, npartitions=estimate_num_partition(nexus_df))
-        nexus_df = nexus_df[nexus_df.within(vpu_boundary.geometry.values[0])].compute()
-
-        if nexus_df.empty:
-            if os.path.exists(altered_network):
-                save_thread.join()
-            return
-        
-        logging.info('Making nexus points')
         (
-            nexus_df
+            gpd.read_parquet(altered_network)
+            .merge(vpu_df, on='LINKNO', how='inner')        
+            .set_crs('epsg:4326')
             .to_crs('epsg:3857')
-            .to_file(nexus_file, driver='GPKG')
-        )
-
-    if os.path.exists(altered_network):
-        save_thread.join()
+            .to_file(vpu_network, driver='GPKG')
+        )  
 
     return
+
+def nexus_file_from_masters(vpu_boundaries: gpd.GeoDataFrame, 
+                            vpu: int,
+                            gpkg_dir: str,
+                            nexus_region_file: str, ) -> None:
+    # Create an enevlope of the current VPU
+    vpu_boundary = vpu_boundaries[vpu_boundaries['VPU'] == str(vpu)]
+    nexus_file = os.path.join(gpkg_dir, f'nexus_{vpu}.gpkg')
+    nexus_df = gpd.read_file(nexus_region_file)
+
+    # Filter the nexus points to the VPU boundary
+    vpu_bounds = vpu_boundary.total_bounds
+    nexus_df = nexus_df.cx[vpu_bounds[0]:vpu_bounds[2], vpu_bounds[1]:vpu_bounds[3]]
+    nexus_df: dgpd.GeoDataFrame = dgpd.from_geopandas(nexus_df, npartitions=estimate_num_partition(nexus_df))
+    nexus_df = nexus_df[nexus_df.within(vpu_boundary.geometry.values[0])].compute()
+
+    if nexus_df.empty:
+        return
+    
+    logging.info('\tMaking nexus points')
+    (
+        nexus_df
+        .to_crs('epsg:3857')
+        .to_file(nexus_file, driver='GPKG')
+    )
+
 
 def make_vpu_gpkg(df: gpd.GeoDataFrame, vpu_network: str) -> None:
     (

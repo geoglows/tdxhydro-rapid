@@ -25,7 +25,8 @@ __all__ = [
 ]
 
 
-def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, out_dir: str, ) -> None:
+def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, 
+                                          out_dir: str, ) -> None:
     new_file_name = os.path.basename(lsm_sample).replace('.nc', '_thiessen_grid.parquet')
     new_file_name = os.path.join(out_dir, new_file_name)
     if os.path.exists(new_file_name):
@@ -72,6 +73,7 @@ def make_thiessen_grid_from_netcdf_sample(lsm_sample: str, out_dir: str, ) -> No
 
     # Remove invalid geometries
     tg_gdf = tg_gdf[tg_gdf['lon'].between(-180, 180) & tg_gdf['lat'].between(-90, 90)]
+    tg_gdf = tg_gdf.reset_index(drop=True)
 
     # save the thiessen grid to disc
     logging.info('\tSaving Thiessen grid to disc')
@@ -97,7 +99,7 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
     logger.info('\tloading thiessen grid')
     tg_gdf = gpd.read_parquet(tg_parquet)
 
-    weight_file_name = get_weight_table_name_from_grid(tg_gdf).replace('.csv', '_full.csv')
+    weight_file_name = get_weight_table_name_from_grid(tg_gdf).replace('.parquet', '_full.parquet')
     out_name = os.path.join(out_dir, weight_file_name)
     if os.path.exists(os.path.join(out_dir, out_name)):
         logger.info(f'Weight table already exists: {os.path.basename(out_name)}')
@@ -122,7 +124,7 @@ def make_weight_table_from_thiessen_grid(tg_parquet: str,
     (
         intersections[[id_field, 'area_sqm', 'lon_index', 'lat_index', 'lon', 'lat']]
         .sort_values([id_field, 'area_sqm'])
-        .to_csv(out_name, index=False)
+        .to_parquet(out_name)
     )
 
 
@@ -130,7 +132,7 @@ def make_weight_table_from_netcdf(lsm_sample: str,
                                   out_dir: str,
                                   basins_gdf: gpd.GeoDataFrame,
                                   id_field: str = 'LINKNO') -> None:
-    out_name = os.path.join(out_dir, 'weight_' + os.path.basename(os.path.splitext(lsm_sample)[0]) + '_full.csv')
+    out_name = os.path.join(out_dir, 'weight_' + os.path.basename(os.path.splitext(lsm_sample)[0]) + '_full.parquet')
     if os.path.exists(os.path.join(out_dir, out_name)):
         logger.info(f'Weight table already exists: {os.path.basename(out_name)}')
         return
@@ -221,7 +223,7 @@ def apply_weight_table_simplifications(save_dir: str,
                                        weight_table_out_path: str,
                                        id_field: str = 'LINKNO') -> None:
     logging.info(f'Processing {weight_table_in_path}')
-    wt = pd.read_csv(weight_table_in_path)
+    wt = pd.read_parquet(weight_table_in_path)
 
     headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
     if os.path.exists(headwater_dissolve_path):
@@ -299,7 +301,7 @@ def apply_weight_table_simplifications(save_dir: str,
     # group by matching values in columns except for area_sqm, and sum the areas in grouped rows
     wt = wt.groupby(wt.columns.drop('area_sqm').tolist()).sum().reset_index()
     wt = wt.sort_values([id_field, 'area_sqm'], ascending=[True, False])
-    wt.to_csv(weight_table_out_path, index=False)
+    wt.to_parquet(weight_table_out_path, index=False)
     return
 
 def get_weight_table_name_from_grid(grid: Union[str, gpd.GeoDataFrame], warn=False) -> str:
@@ -324,7 +326,7 @@ def get_weight_table_name_from_grid(grid: Union[str, gpd.GeoDataFrame], warn=Fal
     xinit = gpq['lon'].round(12).min()
     yinit = gpq['lat'].round(12).min()
     
-    return f"weight_xinit={xinit}_yinit={yinit}_dx={dx}_dy={dy}_.csv"
+    return f"weight_xinit={xinit}_yinit={yinit}_dx={dx}_dy={dy}.parquet"
 
 def get_expected_weight_tables(sample_grids: list[str], warn=False) -> Generator[str, None, None]:
     for grid in sample_grids:

@@ -5,7 +5,6 @@ from typing import Union
 
 import geopandas as gpd
 import dask_geopandas as dgpd
-import dask.dataframe as dd
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -348,6 +347,19 @@ def make_final_streams(final_inputs_directory: str,
         mgdf[mgdf['VPUCode'] == vpu_code].to_file(file_path)
     return
 
+def dissolve_shuffle(ddf: dgpd.GeoDataFrame, by=None, **kwargs):
+    """Shuffle and map partition"""
+
+    meta = ddf._meta.dissolve(by=by, as_index=False, **kwargs)
+
+    shuffled = dgpd.from_dask_dataframe(ddf.shuffle(
+        by, npartitions=ddf.npartitions, shuffle="tasks", ignore_index=True
+    ))
+
+    return shuffled.map_partitions(
+        gpd.GeoDataFrame.dissolve, by=by, as_index=False, meta=meta, **kwargs
+    )
+
 def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame,  id_field: str = 'LINKNO') -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     headwater_dissolve_path = os.path.join(save_dir, 'mod_dissolve_headwater.csv')
 
@@ -383,26 +395,33 @@ def dissolve_catchments(save_dir: str, gdf: gpd.GeoDataFrame,  id_field: str = '
 
     lake_streams_path = os.path.join(save_dir, 'mod_dissolve_lakes.json')
     lake_outlets = set()
+    endorheic_map: dict[int, bool] = {}
+    inlet_map: dict[int, str] = {}
     if os.path.exists(lake_streams_path):
         lake_streams_df = pd.read_json(lake_streams_path, orient='index', convert_axes=False, convert_dates=False)
+        endorheic_map = pd.read_csv(os.path.join('tdxhydrorapid', 'network_data', 'lake_table.csv')).set_index('outlet')['endorheic'].to_dict()
         streams_to_delete = set()
         for outlet, _, lake_streams in lake_streams_df.itertuples():
             outlet = int(outlet)
             lake_outlets.add(outlet)
             if outlet in gdf[id_field].values:
                 gdf.loc[gdf[id_field].isin(lake_streams), id_field] = outlet
+                inlet_map[outlet] = str(lake_streams)[1:-1].replace(' ', '')
             else:
                 streams_to_delete.update(lake_streams)
+
 
         gdf = gdf[~gdf[id_field].isin(streams_to_delete)]
 
     # dissolve the geometries based on shared value in the id field
     logging.info('\tDissolving catchments')
-    dgdf: dd.DataFrame = dd.from_pandas(gdf, npartitions=estimate_num_partition(gdf))
-    dgdf: dgpd.GeoDataFrame = dgpd.from_dask_dataframe(dgdf.shuffle(on=id_field))
-    gdf = dgdf.dissolve(by=id_field).compute().reset_index()
+    dgpf = dgpd.from_geopandas(gdf, npartitions=estimate_num_partition(gdf))
+    gdf = dissolve_shuffle(dgpf, by=id_field).compute().reset_index(drop=True)
+
     if lake_outlets:
         lake_gdf = gdf[gdf[id_field].isin(lake_outlets)]
+        lake_gdf['endorheic'] = lake_gdf[id_field].map(endorheic_map).fillna(False)
+        lake_gdf['inlets'] = lake_gdf[id_field].map(inlet_map).fillna('')
     else:
         lake_gdf = gpd.GeoDataFrame()
     return gdf, lake_gdf
