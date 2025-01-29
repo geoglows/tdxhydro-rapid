@@ -18,10 +18,12 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-lakes_parquet = '/Users/ricky/Downloads/GLAKES/all_lakes_filtered.parquet' # https://garslab.com/?p=234 August 24, 2022
-gpq_dir = '/Volumes/EB406_T7_3/geoglows_v3/parquets'
+lakes_parquet = r"C:\Users\lrr43\Downloads\GLAKES\all_lakes_filtered.parquet" # https://garslab.com/?p=234 August 24, 2022
+gpq_dir = r"D:\geoglows_v3\parquets"
 # gpq_dir = '/Users/ricky/tdxhydro-postprocessing/test/pqs'
-save_dir = './tdxhydrorapid/network_data/'
+save_dir = os.path.join('.', 'tdxhydrorapid', 'network_data')
+
+DEBUG = False
 
 def create_directed_graphs(df: gpd.GeoDataFrame,
                            id_field='LINKNO',
@@ -171,7 +173,7 @@ if __name__ == "__main__":
 
                 # Choosing inlets based on in_degree can miss segments that have one upstream segment that is an inlet, but another upstream that was not in the intersection.
                 # Let's find and add these inlets
-                _continure = False
+                _continue = False
                 to_test = lake_ids - inlets
                 for river in to_test:
                     preds = set(G.predecessors(river))
@@ -182,17 +184,16 @@ if __name__ == "__main__":
 
                         if inlet_to_be in global_inside:
                             # This stream is already in a lake
-                            # print(inlet_to_be)
-                            _continure = True
+                            _continue = True
                         inlets.add(inlet_to_be)
                         other_pred = (preds - {inlet_to_be}).pop()
                         lake_id_dict[inlet_to_be] = lake_id_dict.get(river, lake_id_dict.get(other_pred))
-                if _continure:  
+                if _continue:  
                     continue
 
                 # Add any direct predecessors of inlets that have strmOrder == 1
                 new_inlets = set()
-                _continure = False
+                _continue = False
                 for inlet in inlets:
                     preds = set(G.predecessors(inlet))
                     if not preds:
@@ -203,7 +204,7 @@ if __name__ == "__main__":
                         if lake_id is None:
                             # This usually indicates that this outlet is far removed from a real lake.
                             # This tends to happen for tiny lakes that happened to have a 3+ river confluence
-                            _continure = True
+                            _continue = True
                             continue
 
                         intersection = geom_dict[inlet].intersection(lake_polygon_dict[lake_id])
@@ -220,7 +221,7 @@ if __name__ == "__main__":
                         else:
                             # This stream is mostly outside the lake, so lets maintain it as an inlet
                             new_inlets.add(inlet)
-                if _continure:
+                if _continue:
                     continue
 
                 if len(lake_ids - new_inlets - {outlet}) == 0 or not new_inlets:
@@ -239,17 +240,24 @@ if __name__ == "__main__":
                 global_outlets.add(outlet)
                 global_inside.update(outlet_ans)
 
-                for inlet in new_inlets:
-                    values_list.append((inlet, outlet, lake_id_dict.get(inlet, lake_id_dict.get(outlet))))
+                if len(list(G.successors(outlet))) == 0:
+                    endorheic = True
+                else:
+                    endorheic = False
 
-    df = pd.DataFrame(values_list, columns=['inlet', 'outlet', 'lake_id'])
+                for inlet in new_inlets:
+                    values_list.append((inlet, outlet, lake_id_dict.get(inlet, lake_id_dict.get(outlet)), endorheic))
+
+    df = pd.DataFrame(values_list, columns=['inlet', 'outlet', 'lake_id', 'endorheic'])
     df = df.drop_duplicates() # Sometimes we get duplicate entries, not sure why
-    
-    gdf['type'] = ""
-    gdf.loc[gdf['LINKNO'].isin(df['inlet']), 'type'] = 'inlet'
-    gdf.loc[gdf['LINKNO'].isin(df['outlet']), 'type'] = 'outlet'
-    gdf.loc[gdf['LINKNO'].isin(global_inside), 'type'] = 'inside'
-    gdf[gdf['type'] != ''].to_parquet('inlets_outlets.parquet')
+
     out_name = os.path.join(save_dir, 'lake_table.csv')
     df.to_csv(out_name, index=False)
     logging.info(f'Saved lakes to {out_name}')
+
+    if DEBUG:
+        gdf['type'] = ""
+        gdf.loc[gdf['LINKNO'].isin(df['inlet']), 'type'] = 'inlet'
+        gdf.loc[gdf['LINKNO'].isin(df['outlet']), 'type'] = 'outlet'
+        gdf.loc[gdf['LINKNO'].isin(global_inside), 'type'] = 'inside'
+        gdf[gdf['type'] != ''].to_parquet('inlets_outlets.parquet')
