@@ -10,13 +10,15 @@ import geopandas as gpd
 
 import tdxhydrorapid as rp
 
-tdx_inputs_dir = '/Users/ricky/tdxhydro-postprocessing/test/rapid_inputs'
-og_pqs = glob.glob("/Users/ricky/tdxhydro-postprocessing/test/pqs/TDX_streamnet_*_01.parquet")
-final_output_dir = '/Users/ricky/tdxhydro-postprocessing/test/vpus'
-vpu_inputs_dir = os.path.join(final_output_dir, 'inputs')
-gpkg_dir = os.path.join(final_output_dir, 'streams')
-vpu_assignment_table = './tdxhydrorapid/network_data/vpu_table.csv'
-vpu_boundaries = '/Users/ricky/Downloads/vpu-boundaries.gpkg' or None
+tdx_inputs_dir = r"D:\geoglows_v3\geoglows_v3\tdx_alterations"
+og_pqs = glob.glob(r"D:\geoglows_v3\parquets\TDX_streamnet_*_01.parquet")
+final_output_dir = r"D:\geoglows_v3\geoglows_v3\hydrography"
+# vpu_inputs_dir = os.path.join(final_output_dir, 'inputs')
+vpu_inputs_dir = r"D:\geoglows_v3\geoglows_v3\routing_configs"
+# gpkg_dir = os.path.join(final_output_dir, 'streams')
+gpkg_dir = final_output_dir
+vpu_assignment_table = os.path.join('.', 'tdxhydrorapid', 'network_data', 'vpu_table.csv') #'./tdxhydrorapid/network_data/vpu_table.csv'
+vpu_boundaries = r"D:\geoglows_v3\vpu-boundaries.gpkg" or None
 
 MAKE_GPKG = True
 
@@ -46,12 +48,17 @@ for vpu in sorted(mdf['VPUCode'].unique()):
     vpu_df = mdf.loc[mdf['VPUCode'] == vpu]
     tdx_region = str(vpu_df['TDXHydroRegion'].values[0])
 
+    hydrography_dir = os.path.join(gpkg_dir, f"{vpu}")
+    os.makedirs(hydrography_dir, exist_ok=True)
     vpu_dir = os.path.join(vpu_inputs_dir, str(vpu))
-    if os.path.exists(vpu_dir) and (not MAKE_GPKG or os.path.exists(os.path.join(gpkg_dir, f'streams_{vpu}.gpkg'))):
-        if rp.check_outputs_are_valid(vpu_dir):
-            continue
-        else:
-            shutil.rmtree(vpu_dir)
+    if os.path.exists(vpu_dir) and (not MAKE_GPKG or os.path.exists(os.path.join(hydrography_dir, f'streams_{vpu}.gpkg'))) and os.path.exists(os.path.join(hydrography_dir, f'nexus_{vpu}.gpkg')):
+        try:
+            if rp.check_outputs_are_valid(vpu_dir):
+                continue
+            else:
+                shutil.rmtree(vpu_dir)
+        except FileNotFoundError:
+            pass
 
     os.makedirs(vpu_dir, exist_ok=True)
     try:
@@ -59,8 +66,11 @@ for vpu in sorted(mdf['VPUCode'].unique()):
                                          vpu_dir,
                                          tdxinputs_directory=tdx_inputs_dir,
                                          make_gpkg=MAKE_GPKG,
-                                         gpkg_dir=gpkg_dir, 
-                                         vpu_boundaries=vpu_bounds_gdf)
+                                         gpkg_dir=hydrography_dir,)
+        
+        nexus_region_file = os.path.join(tdx_inputs_dir, tdx_region, 'nexus_points.gpkg')
+        if os.path.exists(nexus_region_file) and vpu_bounds_gdf is not None:
+            rp.inputs.nexus_file_from_masters(vpu_bounds_gdf, vpu, hydrography_dir, nexus_region_file)
     except Exception as e:
         logging.error(vpu)
         logging.error(tdx_region)
@@ -70,4 +80,5 @@ for vpu in sorted(mdf['VPUCode'].unique()):
 
     if not rp.check_outputs_are_valid(vpu_dir):
         shutil.rmtree(vpu_dir)
+        shutil.rmtree(hydrography_dir)
         continue
